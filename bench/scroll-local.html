@@ -1,0 +1,22 @@
+<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>scroll bench</title>
+<style>
+body{font:17px -apple-system;margin:0 16px;background:#fff}
+.card{height:180px;border-radius:14px;margin:12px 0;display:flex;align-items:flex-end;padding:14px;color:#fff;font-weight:600;box-sizing:border-box}
+#bar{position:fixed;left:24px;right:24px;bottom:28px;height:56px;border-radius:28px;background:rgba(255,255,255,.35);
+ -webkit-backdrop-filter:blur(18px) saturate(1.6);backdrop-filter:blur(18px) saturate(1.6);box-shadow:0 4px 18px rgba(0,0,0,.18)}
+</style>
+<div id=c></div><div id=bar></div>
+<script>
+// A feed (text and picture-like cards) that scrolls itself at 900 px/s, time-based, wrapping to the
+// top at the end; a blurred floating bar keeps the compositor busy as a web page with glass would.
+// Everything is local: no network.
+const c=document.getElementById("c"),w="Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua".split(" ");
+for(let i=0;i<200;i++){const h=document.createElement("h3");h.textContent="Item "+i;c.appendChild(h);
+ const p=document.createElement("p");p.textContent=Array.from({length:60},(_,j)=>w[(i*7+j*3)%w.length]).join(" ");c.appendChild(p);
+ if(i%2==0){const d=document.createElement("div");d.className="card";const a=(i*37)%360;
+  d.style.background=`linear-gradient(135deg,hsl(${a},80%,55%),hsl(${(a+70)%360},70%,35%))`;d.textContent="Picture "+i;c.appendChild(d);}}
+const t0=performance.now();
+function f(t){const max=document.body.scrollHeight-innerHeight;window.scrollTo(0,((t-t0)*0.9)%max);requestAnimationFrame(f)}
+requestAnimationFrame(f);
+</script>

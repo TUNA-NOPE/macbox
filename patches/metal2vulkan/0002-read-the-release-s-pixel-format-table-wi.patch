@@ -1,0 +1,81 @@
+From 0d31d29c8ceccc9bb17e4920ff543dbd112c62a5 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 16:13:56 +0000
+Subject: [PATCH 2/5] read the release's pixel format table
+ without a device
+
+Reims answers whether Metal describes a pixel format, the format's name
+and its block words from places that hold no device: a texture
+descriptor's setPixelFormat:, its heap-layout rules and its CPU-write
+unit. Up to a759d0e8 it read them from MetalLevel::pixel_format_info and
+MetalLevel::describes, which took no device. ec72c052 removed MetalLevel
+and left the table reachable only through Device::pixel_format_info and
+Device::texture_level_info, whose answers no device decides (both just
+call the crate-private table functions). The alternatives on Reims's
+side were to make or look up a Vulkan device for every such answer, or
+to copy the table.
+
+PixelFormatInfo::of(raw) and TextureLevelInfo::of(&query) answer the
+same table without a device: the same functions the Device methods
+call, so nothing a device answers changes. api_signatures.tsv
+re-blessed with scripts/api-signatures/signatures.py --bless (two rows
+added, nothing else moved).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../metal2vulkan-runtime/src/pixel_format_info.rs  | 14 ++++++++++++++
+ crates/metal2vulkan/tests/api_signatures.tsv       |  2 ++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/crates/metal2vulkan-runtime/src/pixel_format_info.rs b/crates/metal2vulkan-runtime/src/pixel_format_info.rs
+index 6235028d..3b7956fe 100644
+--- a/crates/metal2vulkan-runtime/src/pixel_format_info.rs
++++ b/crates/metal2vulkan-runtime/src/pixel_format_info.rs
+@@ -58,6 +58,13 @@ impl PixelFormatInfo {
+         words: [0; 4],
+     };
+ 
++    /// Metal's description of the raw pixel format value `raw` at the release every device
++    /// answers as: what [`Device::pixel_format_info`] answers on every device, for a caller
++    /// that holds none (a descriptor's setter). No Metal counterpart: Metal's takes a device.
++    pub fn of(raw: u64) -> PixelFormatInfo {
++        pixel_format_info(raw)
++    }
++
+     /// Whether Metal describes a format here (any answer but [`INVALID`](Self::INVALID)).
+     pub fn describes_a_format(&self) -> bool {
+         *self != PixelFormatInfo::INVALID
+@@ -208,6 +215,13 @@ pub struct TextureLevelInfo {
+ }
+ 
+ impl TextureLevelInfo {
++    /// Metal's layout of the level `query` names at the release every device answers as: what
++    /// [`Device::texture_level_info`] answers on every device, for a caller that holds none. No
++    /// Metal counterpart: Metal's takes a device.
++    pub fn of(query: &TextureLevelQuery) -> TextureLevelInfo {
++        texture_level_info(query)
++    }
++
+     /// The 13 words in Metal's order.
+     pub fn words(&self) -> [u64; 13] {
+         [
+diff --git a/crates/metal2vulkan/tests/api_signatures.tsv b/crates/metal2vulkan/tests/api_signatures.tsv
+index 9fa297bc..fc35f3e7 100644
+--- a/crates/metal2vulkan/tests/api_signatures.tsv
++++ b/crates/metal2vulkan/tests/api_signatures.tsv
+@@ -7932,6 +7932,7 @@ method	metal2vulkan-runtime::PipelineOption::from_raw	pub const fn from_raw(raw:
+ method	metal2vulkan-runtime::PipelineOption::raw	pub const fn raw(self) -> u64
+ method	metal2vulkan-runtime::PipelineOptions::new	pub fn new(options: PipelineOption) -> PipelineOptions
+ method	metal2vulkan-runtime::PixelFormatInfo::describes_a_format	pub fn describes_a_format(&self) -> bool
++method	metal2vulkan-runtime::PixelFormatInfo::of	pub fn of(raw: u64) -> PixelFormatInfo
+ method	metal2vulkan-runtime::PrivateAnswer::metal	pub fn metal(self) -> T
+ method	metal2vulkan-runtime::PrivateAnswer::value	pub fn value(self) -> Option<T>
+ method	metal2vulkan-runtime::PrivateCount::selector	pub fn selector(self) -> &'static str
+@@ -8217,6 +8218,7 @@ method	metal2vulkan-runtime::Texture::width	pub fn width(&self) -> u64
+ method	metal2vulkan-runtime::TextureDescriptor::texture_2d	pub fn texture_2d(pixel_format: PixelFormat, width: u64, height: u64, mipmapped: bool) -> TextureDescriptor
+ method	metal2vulkan-runtime::TextureDescriptor::texture_buffer	pub fn texture_buffer(pixel_format: PixelFormat, width: u64, resource_options: ResourceOptions, usage: TextureUsage) -> TextureDescriptor
+ method	metal2vulkan-runtime::TextureDescriptor::texture_cube	pub fn texture_cube(pixel_format: PixelFormat, size: u64, mipmapped: bool) -> TextureDescriptor
++method	metal2vulkan-runtime::TextureLevelInfo::of	pub fn of(query: &TextureLevelQuery) -> TextureLevelInfo
+ method	metal2vulkan-runtime::TextureLevelInfo::words	pub fn words(&self) -> [u64; 13]
+ method	metal2vulkan-runtime::TextureLevelQuery::plane_2d	pub fn plane_2d(pixel_format: u64, width: u64, height: u64) -> TextureLevelQuery
+ method	metal2vulkan-runtime::TextureSwizzleChannels::compose	pub fn compose(self, format: crate::vk::ComponentMapping) -> crate::vk::ComponentMapping

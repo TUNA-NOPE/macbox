@@ -1,0 +1,15 @@
+[Unit]
+Description=Shut down iOS Simulators in the mac-sim pool that nobody used for a while
+
+[Service]
+Type=oneshot
+# Minutes without a mac-sim command, a viewer or an app switch before a booted pool simulator
+# is shut down. MAC_SIM_IDLE_DRY_RUN=1 only logs what it would do. mac-sim reads the rest of
+# its settings from ~/.config/macbox/macbox.env.
+Environment=MAC_SIM_IDLE_MINUTES=20
+# Use mac-sim's running SSH master if there is one, never start one (systemd would kill it
+# when this unit ends, cutting off an agent's command that shares it).
+Environment=MAC_SIM_SSH_MASTER=no
+ExecStart=%h/.local/bin/mac-sim idle
+TimeoutStartSec=5min
+Nice=10

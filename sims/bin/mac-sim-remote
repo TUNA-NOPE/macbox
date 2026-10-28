@@ -1,0 +1,228 @@
+#!/bin/bash
+# mac-sim-remote: the Mac side of `mac-sim` (runs in macbox's macOS VM, over SSH).
+# `mac-sim` copies this file to ~/.local/lib/mac-sim/ on the Mac when it changes
+# (MAC_SIM_LIB, set by mac-sim, can name another folder).
+#
+#   setup                          install agent-device beside this file, if it isn't there
+#   state                          "udid state name" for every available simulator
+#   boot <udid>                    boot and wait until iOS is up
+#   shutdown <udid>
+#   ad <udid> <session> <args...>  agent-device on that simulator, in its own session
+#   shot <udid> <file>             lossless screenshot at the simulator's resolution
+#   record <udid> <seconds> <file> H.264 video (up to 60 frames/s)
+#   openurl <udid> <url>
+#   install <udid> <app>           install a .app; prints its bundle id
+#   launch <udid> <bundle id>
+#   expogo <udid> <sdk major>      install the Expo Go that matches the SDK, if missing
+#   build <src dir> <app subdir> <udid> <metro port> <Debug|Release> <managed|bare> [source]
+#                                  "source": build React Native from source instead of its
+#                                  prebuilt core (for libraries that need its old headers)
+#                                  install dependencies, prebuild, pod install and xcodebuild the
+#                                  Expo app copied to <src dir>; install it; prints its bundle id
+#   idleinfo <udid...>             for `mac-sim idle`: "udid state minutes-since-boot viewers name"
+#   appswitches <udid> <minutes>   apps brought to the foreground in the last <minutes>
+#   idleshutdown <udid> <session>  shut down, unless a viewer appeared meanwhile
+set -uo pipefail
+# PATH, first to last: a portable Ruby with CocoaPods' user gems (`pod` runs the first ruby
+# on PATH), macbox's own tools, Homebrew, Node in /usr/local/bin, then the system. ~/.zshenv
+# has them too; this keeps the helper working when it doesn't.
+p=""
+for d in "$HOME"/.local/portable-ruby/current/bin "$HOME"/.local/share/gem/ruby/*/bin "$HOME/.macbox/bin" \
+         /opt/homebrew/bin /usr/local/bin; do
+  [ -d "$d" ] && p="$p$d:"
+done
+export PATH="$p$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+LIB="${MAC_SIM_LIB:-$HOME/.local/lib/mac-sim}"
+AD="$LIB/node_modules/.bin/agent-device"
+AD_VERSION="${MAC_SIM_AD_VERSION:-0.21.31}"
+CACHE="$HOME/Library/Caches/mac-sim"
+mkdir -p "$CACHE"
+
+die() { echo "mac-sim (Mac): $*" >&2; exit 1; }
+booted() { xcrun simctl list devices | grep "$1" | grep -q "(Booted)"; }
+need_ad() {
+  [ -x "$AD" ] && return 0
+  command -v npm >/dev/null 2>&1 || die "agent-device needs Node and npm on the Mac (macbox sets them up when it provisions the Mac)"
+  echo "mac-sim (Mac): installing agent-device $AD_VERSION in $LIB" >&2
+  npm install --prefix "$LIB" --no-audit --no-fund --loglevel=error "agent-device@$AD_VERSION" >&2 \
+    || die "could not install agent-device (npm install --prefix $LIB agent-device@$AD_VERSION)"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  setup)
+    need_ad
+    echo "agent-device $("$AD" --version 2>/dev/null | tail -1) in $LIB" ;;
+  state)
+    xcrun simctl list devices -j | /usr/bin/python3 -c '
+import json, sys
+for devs in json.load(sys.stdin)["devices"].values():
+    for d in devs:
+        if d.get("isAvailable", True): print(d["udid"], d["state"], d["name"])' ;;
+  boot)
+    u="$1"
+    # Simulator.app opens a window per booted simulator: double the GPU work. Nothing here needs it.
+    pgrep -qf "Simulator.app/Contents/MacOS/Simulator" && osascript -e 'quit app "Simulator"' >/dev/null 2>&1
+    booted "$u" || xcrun simctl boot "$u" 2>&1 | grep -v "current state: Booted" >&2
+    xcrun simctl bootstatus "$u" -b >/dev/null 2>&1 || die "simulator $u did not finish booting" ;;
+  shutdown)
+    xcrun simctl shutdown "$1" 2>/dev/null || true ;;
+  ad)
+    u="$1" s="$2"; shift 2
+    need_ad
+    export AGENT_DEVICE_STATE_DIR="$HOME/.mac-sim/$s/agent-device"
+    mkdir -p "$AGENT_DEVICE_STATE_DIR"
+    cd "$HOME/.mac-sim/$s" || exit 1
+    exec "$AD" "$@" --platform ios --udid "$u" --session "$s" ;;
+  shot)
+    xcrun simctl io "$1" screenshot --type=png "$2" >/dev/null 2>&1 || die "screenshot failed" ;;
+  record)
+    u="$1" secs="$2" out="$3"
+    rm -f "$out"
+    xcrun simctl io "$u" recordVideo --codec=h264 --force "$out" >/dev/null 2>&1 &
+    p=$!
+    sleep "$secs"
+    kill -INT "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+    [ -s "$out" ] || die "the recording is empty" ;;
+  openurl)
+    xcrun simctl openurl "$1" "$2" ;;
+  install)
+    u="$1" app="$2"
+    xcrun simctl install "$u" "$app" || die "install failed"
+    /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist" ;;
+  launch)
+    xcrun simctl launch "$1" "$2" >/dev/null ;;
+  expogo)
+    u="$1" sdk="$2"
+    if xcrun simctl listapps "$u" 2>/dev/null | grep -q '"host.exp.Exponent"'; then
+      have=$(xcrun simctl listapps "$u" | awk '/"host.exp.Exponent"/,/};/' | sed -n 's/.*CFBundleShortVersionString = "\{0,1\}\([0-9.]*\).*/\1/p' | head -1)
+      [ "${have%%.*}" = "$sdk" ] && { echo "Expo Go $have already installed"; exit 0; }
+    fi
+    url=$(curl -fsSL https://exp.host/--/api/v2/versions | /usr/bin/python3 -c "
+import json, sys; v = json.load(sys.stdin)['sdkVersions'].get('$sdk.0.0') or {}; print(v.get('iosClientUrl') or '')")
+    [ -n "$url" ] || die "no Expo Go for SDK $sdk"
+    d="$CACHE/expo-go/$(basename "$url" .tar.gz)"
+    if [ ! -d "$d/Expo Go.app" ]; then
+      rm -rf "$d"; mkdir -p "$d/Expo Go.app"
+      curl -fsSL "$url" | tar -xz -C "$d/Expo Go.app" || die "could not download $url"
+    fi
+    xcrun simctl install "$u" "$d/Expo Go.app" || die "could not install Expo Go"
+    echo "installed $(basename "$d")" ;;
+  build)
+    src="$1" sub="$2" u="$3" port="$4" conf="${5:-Debug}" kind="${6:-managed}" rn="${7:-prebuilt}"
+    src=$(cd "$src" 2>/dev/null && pwd) || die "no folder $1 on the Mac"
+    app=$(cd "$src/$sub" 2>/dev/null && pwd) || die "no app folder $sub in $src"
+    cd "$app" || exit 1
+    export CI=1 LANG="${LANG:-en_US.UTF-8}" EXPO_NO_TELEMETRY=1
+    state="$app/.mac-sim"; mkdir -p "$state"
+    # 1. Dependencies, with the project's package manager, where its lockfile is.
+    lockof() { local f; for f in bun.lock bun.lockb pnpm-lock.yaml yarn.lock package-lock.json; do [ -f "$1/$f" ] && { echo "$1/$f"; return 0; }; done; return 1; }
+    lockdir="$app"
+    until lock=$(lockof "$lockdir") || [ "$lockdir" = "$src" ]; do lockdir=$(dirname "$lockdir"); done
+    sum=$(cat "$lock" "$app/package.json" 2>/dev/null | shasum | cut -c1-40)
+    if [ "$sum" != "$(cat "$state/deps.sum" 2>/dev/null)" ] || [ ! -d "$app/node_modules" ]; then
+      echo "== installing dependencies ($(basename "${lock:-package.json}"))"
+      ( cd "$lockdir" && case "$(basename "${lock:-none}")" in
+          bun.lock|bun.lockb)
+            [ -x "$HOME/.bun/bin/bun" ] || curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+            "$HOME/.bun/bin/bun" install --frozen-lockfile || "$HOME/.bun/bin/bun" install ;;
+          pnpm-lock.yaml) corepack pnpm install --frozen-lockfile ;;
+          yarn.lock) corepack yarn install --frozen-lockfile || corepack yarn install ;;
+          package-lock.json) npm ci --no-audit --no-fund ;;
+          *) npm install --no-audit --no-fund ;;
+        esac ) || die "installing dependencies failed"
+      echo "$sum" > "$state/deps.sum"
+    fi
+    # 2. The native project: generated again when the app config or dependencies change.
+    if [ "$rn" = source ]; then export RCT_USE_PREBUILT_RNCORE=0 RCT_USE_RN_DEP=0; fi
+    cfg=$( (cat "$app"/app.json "$app"/app.config.* "$app/package.json" 2>/dev/null; echo "$rn") | shasum | cut -c1-40)
+    if [ "$kind" = bare ]; then
+      if [ ! -d "$app/ios/Pods" ] || [ "$sum$rn" != "$(cat "$state/pods.sum" 2>/dev/null)" ]; then
+        echo "== pod install"
+        ( cd "$app/ios" && pod install ) || die "pod install failed"
+        echo "$sum$rn" > "$state/pods.sum"
+      fi
+    elif [ ! -d "$app/ios" ] || [ "$cfg" != "$(cat "$state/prebuild.sum" 2>/dev/null)" ]; then
+      echo "== expo prebuild (ios) and pod install"
+      npx expo prebuild -p ios --clean || die "expo prebuild failed"
+      echo "$cfg" > "$state/prebuild.sum"
+    fi
+    ws=$(ls -d "$app"/ios/*.xcworkspace 2>/dev/null | head -1)
+    [ -n "$ws" ] || die "no Xcode workspace in $app/ios (did pod install run?)"
+    scheme=$(basename "$ws" .xcworkspace)
+    # 3. Compile for this Intel simulator only.
+    echo "== xcodebuild $scheme ($conf)"
+    dd="$state/DerivedData"
+    xcodebuild -workspace "$ws" -scheme "$scheme" -configuration "$conf" -sdk iphonesimulator \
+      -destination "id=$u" -derivedDataPath "$dd" ONLY_ACTIVE_ARCH=YES RCT_METRO_PORT="$port" build \
+      > "$state/xcodebuild.log" 2>&1 || { grep -E "error:|BUILD FAILED" "$state/xcodebuild.log" | tail -25 >&2; die "xcodebuild failed (log on the Mac: $state/xcodebuild.log)"; }
+    built=$(ls -d "$dd/Build/Products/$conf-iphonesimulator/"*.app 2>/dev/null | grep -v -- '-Runner.app' | head -1)
+    [ -n "$built" ] || die "the build made no .app"
+    id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$built/Info.plist")
+    xcrun simctl install "$u" "$built" || die "install failed"
+    # A Debug build loads its JavaScript from Metro on the host, at localhost:<port> through the tunnel.
+    [ "$conf" = Debug ] && xcrun simctl spawn "$u" defaults write "$id" RCT_jsLocation "localhost:$port"
+    echo "BUNDLE_ID=$id" ;;
+  idleinfo)
+    # Viewers of a simulator, counted per UDID:
+    #   logstream  `simctl spawn <udid> log stream`: each expo-device-hub runs one while a client
+    #              follows the simulator's foreground app (/appstate, /metrics). T3's Device panel
+    #              does that while it is visible, a hub's own viewer page while it shows it.
+    #   webrtc     WebRTC sessions in any hub's webrtc/stats (a viewer page; gone ~30 s after).
+    #   simapp     Simulator.app is open (it shows every booted simulator).
+    xcrun simctl list devices -j | /usr/bin/python3 -c '
+import datetime, glob, json, os, re, subprocess, sys, time, urllib.request
+devs = {d["udid"].upper(): d for ds in json.load(sys.stdin)["devices"].values() for d in ds}
+ps = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout.splitlines()
+# (Patterns are regexes so that they never match this script'"'"'s own command line.)
+ports = {int(m.group(1)) for l in ps for m in [re.search(r"expo-device-hub\S*/cli\.mjs .*--port[= ](\d+)", l)] if m}
+for f in glob.glob(os.path.expanduser("~/.t3/device/hosts/*/hub.json")):
+    try: ports.add(int(json.load(open(f))["port"]))
+    except Exception: pass
+simapp = int(any(re.search(r"/Simulator\.app/Contents/MacOS/Simulator( |$)", l) for l in ps))
+for u in (a.upper() for a in sys.argv[1:]):
+    d = devs.get(u)
+    if not d:
+        print(u, "missing -1 - -"); continue
+    logs = sum(1 for l in ps if re.search(r"simctl spawn " + u + r" log stream", l, re.I))
+    webrtc = 0
+    if d["state"] == "Booted":
+        for p in sorted(ports):
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/vendor/serve-sim/helper/%s/webrtc/stats" % (p, u), timeout=3) as r:
+                    webrtc += len(json.load(r).get("sessions") or [])
+            except Exception:
+                pass
+    mins = -1
+    if d.get("lastBootedAt"):
+        t = datetime.datetime.strptime(d["lastBootedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        mins = int((time.time() - t.timestamp()) // 60)
+    print(u, d["state"], mins, "logstream=%d,webrtc=%d,simapp=%d" % (logs, webrtc, simapp if d["state"] == "Booted" else 0), d["name"])
+' "$@" ;;
+  appswitches)
+    # Apps that came to the foreground (SpringBoard's log), minus widgets, extensions and system
+    # view services (expo-device-hub's own filter). Prints "<count> <last bundle id>".
+    xcrun simctl spawn "$1" log show --last "${2}m" --style ndjson \
+      --predicate 'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"' 2>/dev/null \
+    | /usr/bin/python3 -c '
+import json, re, sys
+skip = re.compile(r"(^|\.)(WidgetRenderer|ExtensionHost|Service|PlaceholderApp|InCallService|CallUI|InCallUI)(\.|$)|\.extension(\.|$)|com\.apple\.(?:[^.]*ViewService$|Preferences\.Cellular|purplebuddy|chrono|shuttle|usernotificationsui)", re.I)
+n, last = 0, "-"
+for line in sys.stdin:
+    try: m = re.search(r"\[app<([^>]+)>:-?\d+\] Setting process visibility to: Foreground", json.loads(line).get("eventMessage", ""))
+    except Exception: continue
+    if m and not skip.search(m.group(1)):
+        n, last = n + 1, m.group(1)
+print(n, last)' ;;
+  idleshutdown)
+    u="$1" s="$2"
+    v=$("$0" idleinfo "$u" | awk '{print $4}')
+    [ "$v" = "logstream=0,webrtc=0,simapp=0" ] || { echo "watched $v"; exit 0; }
+    # Close mac-sim's agent-device session first, as `mac-sim down` does.
+    [ -d "$HOME/.mac-sim/$s" ] && perl -e 'alarm 60; exec @ARGV' "$0" ad "$u" "$s" close >/dev/null 2>&1
+    xcrun simctl shutdown "$u" 2>/dev/null || true
+    booted "$u" && { echo "still booted"; exit 1; }
+    echo shutdown ;;
+  *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2; exit 2 ;;
+esac

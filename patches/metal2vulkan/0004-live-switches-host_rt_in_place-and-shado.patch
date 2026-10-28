@@ -1,0 +1,1814 @@
+From 04698bfc53e104311bd091aef97e12a19460468a Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 18:23:46 +0000
+Subject: [PATCH 4/5] live switches host_rt_in_place and
+ shadow_compressed for textures over host pages
+
+host_rt_in_place (default off): under HostPageTexturePolicy::InPlace, a
+texture over host pages whose usage renders into it or writes it is the
+image in place (as a sampled one is), where the device's render-target
+check passed for the pages' class (host_rt.rs). The check, per class, on
+a thread of its own (started as the device is made where the switch is
+on, else waited for, up to 5 s, by the first texture that asks): a
+pattern in the pages, a texture of RenderTarget|ShaderRead over them,
+then one internal submission making the image's first move from
+UNDEFINED, a LOAD/STORE pass with vkCmdClearAttachments of a rectangle,
+a CLEAR-load pass over a second render area and a DONT_CARE-load pass
+over a third, all in GENERAL, while a thread writes every non-texel byte
+(row padding, bytes after the image); every byte must read as due. Six
+shapes (1/4/8/16-byte texels, padded and packed rows, 3440x1440 at a
+13824-byte pitch), twice each. On ANV 26.2.4 (Arrow Lake): Pointer and
+Fresh pass in 0.25 s, DmaBuf unchecked. The image tries the feedback
+loop plan, then the undeclared usage, then the texture's own, as a
+linear alias over the runtime's own buffer does. host_rt_max_texels
+keeps larger textures shadows. Under the switch an image use of a key
+over host pages takes the uses of all the key's bytes in
+host_aliases::augmented, so an in-place write orders against other
+imports of the same pages.
+
+shadow_compressed (default off): a shadow planned mutable to any format
+(PixelFormatView usage) takes the format list of the texture's own
+views, so ANV may give it CCS_E. A RenderTarget|ShaderRead shadow is
+CCS-eligible already (MUTABLE with B8G8R8A8_UNORM, _SRGB, R8G8B8A8_UINT,
+exclusive, optimal, no ALIAS/HOST_TRANSFER/external): the switch changes
+nothing there.
+
+M2V_SHADOW_PLANS prints each shadow's plan (diagnostic).
+M2V_LANE_IN_PLACE=1 gives lane devices the product's in-place policy.
+host_rt_frames.rs measures frames under each setting, plus a clear
+probe. live::set overrides a switch in-process. api_signatures.tsv
+re-blessed (Device::settle_host_rt_checks, host_rt_check_report,
+live::set).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/device/mod.rs |   8 +
+ .../metal2vulkan-runtime/src/host_aliases.rs  |  22 +-
+ crates/metal2vulkan-runtime/src/host_rt.rs    | 806 ++++++++++++++++++
+ crates/metal2vulkan-runtime/src/in_place.rs   |   6 +
+ .../src/in_place_check.rs                     |  12 +-
+ crates/metal2vulkan-runtime/src/lib.rs        |   2 +
+ crates/metal2vulkan-runtime/src/live.rs       |  23 +-
+ crates/metal2vulkan-runtime/src/texture.rs    | 108 +++
+ .../src/texture/in_place_image.rs             |  22 +
+ .../src/runtime_lane.rs                       |   9 +
+ .../src/runtime_lane/host_rt_frames.rs        | 485 +++++++++++
+ .../src/runtime_lane/no_copy_textures.rs      |   7 +-
+ .../src/runtime_lane/pitched_surfaces.rs      |   5 +-
+ crates/metal2vulkan/tests/api_signatures.tsv  |   5 +
+ 14 files changed, 1508 insertions(+), 12 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/host_rt.rs
+ create mode 100644 crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 20fd6a1a..70a18c56 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -309,6 +309,9 @@ pub(super) struct DeviceShared {
+     /// Its check of the first move of an image over host pages, per class of pages, and its
+     /// verdicts (`in_place.rs`).
+     pub(crate) in_place: crate::in_place::InPlaceChecks,
++    /// macbox: its check of rendering into an image in place over host pages, per class
++    /// of pages, and its verdicts (`host_rt.rs`).
++    pub(crate) host_rt: crate::in_place::InPlaceChecks,
+     /// How no-copy buffers import host memory, or why they are refused.
+     pub(super) host_import: Result<Importer, metal2vulkan::error::Unsupported>,
+     /// Whether the device imports a pointer to shared memory, once asked
+@@ -1766,6 +1769,8 @@ impl Device {
+             textures,
+             shader_cache,
+             in_place: crate::in_place::InPlaceChecks::new(fail_in_place_check),
++            // macbox: the render-target check (`host_rt.rs`).
++            host_rt: crate::in_place::InPlaceChecks::new(fail_in_place_check),
+             host_import,
+             shared_pointer_imports: OnceLock::new(),
+             extended_dynamic_state,
+@@ -1860,6 +1865,9 @@ impl Device {
+         }
+         // The verdicts of its check of textures over host pages, where a record holds them.
+         device.recall_in_place_checks();
++        // macbox: where the switch `host_rt_in_place` is on as the device is made, its
++        // render-target check starts now, on a thread of its own (`host_rt.rs`).
++        device.start_host_rt_checks_if_switched();
+         device.degrade_argument_buffers_unread();
+         device.degrade_float_tininess();
+         Ok(device)
+diff --git a/crates/metal2vulkan-runtime/src/host_aliases.rs b/crates/metal2vulkan-runtime/src/host_aliases.rs
+index 9990acbf..11b17838 100644
+--- a/crates/metal2vulkan-runtime/src/host_aliases.rs
++++ b/crates/metal2vulkan-runtime/src/host_aliases.rs
+@@ -456,16 +456,34 @@ pub(super) fn augmented(
+         }
+         all.push(added);
+     };
++    // macbox: where textures over host pages render or write in place
++    // (`host_rt_in_place`, `host_rt.rs`), an image's use of a key (an image in place, keyed as its
++    // buffer) takes the uses of every byte the key lies over: a render pass's write through one
++    // import of a surface's pages is ordered before a read through another import of them (the
++    // `surface_aliases` lane's surface made after a remap), as a byte use is. It orders more than
++    // the texels need, never less. Asked once a call, at its first image use.
++    let mut images = None;
++    let whole = 0..u64::MAX;
+     for used in uses {
+-        let UseRange::Bytes(bytes) = &used.range else {
+-            continue;
++        let bytes = match &used.range {
++            UseRange::Bytes(bytes) => bytes,
++            UseRange::Image { .. } if *images.get_or_insert_with(crate::host_rt::switched) => {
++                &whole
++            }
++            UseRange::Image { .. } => continue,
+         };
+         let joined = aliases
+             .and_then(|aliases| aliases.get(&used.key))
+             .map(|alias| alias.key);
+         if let Some(key) = joined {
++            // macbox: an image's use takes the memory's every byte (above).
++            let range = match &used.range {
++                UseRange::Image { .. } => UseRange::Bytes(whole.clone()),
++                range => range.clone(),
++            };
+             add(Use {
+                 key,
++                range,
+                 ..used.clone()
+             });
+         }
+diff --git a/crates/metal2vulkan-runtime/src/host_rt.rs b/crates/metal2vulkan-runtime/src/host_rt.rs
+new file mode 100644
+index 00000000..f56f6938
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/host_rt.rs
+@@ -0,0 +1,806 @@
++//! macbox: textures over host pages that render or write, in place.
++//!
++//! Upstream takes a texture over host pages in place only where its declared usage samples or
++//! reads it (`in_place.rs`): one that renders into it or writes it through a shader is a shadow
++//! (`ShadowCause::RenderTarget`, `ShadowCause::ShaderWrite`), copied in before each use and merged
++//! back after each write, because an image bound to host pages starts `UNDEFINED`
++//! (`VUID-VkImageCreateInfo-pNext-01443`) and Vulkan lets its layout transitions and a render
++//! pass's load and store operations read and write every byte bound to it: the bytes between its
++//! rows and around its render area among them, which the CPU (the guest) may write meanwhile.
++//!
++//! - **The switch.** `host_rt_in_place` (`live.rs`, default off) takes such a texture in place,
++//!   under `HostPageTexturePolicy::InPlace`, where the device's check of the first move passed for
++//!   the pages' class (`in_place_check.rs`) and so did the check below. Decided as the texture is
++//!   made: a texture made before the switch changed keeps its form.
++//! - **Its image** is the image in place `texture/in_place_image.rs` makes (a linear image made for
++//!   host allocations, or a `DRM_FORMAT_MOD_LINEAR` one at Metal's pitch, or a dma-buf's), tried as
++//!   a linear image aliasing a buffer of the runtime's own is (`Device::storage_over_buffer`'s
++//!   `None` branch): with the feedback loop usage, then with the usage the texture lacks, then
++//!   with its own plan, the first the device makes. From there it is an aliasing image like any
++//!   other: render passes, tile dispatches, the interlock and compute writes take it as they take a
++//!   linear image over a buffer of the runtime's own, and the tracker orders it as the buffer's
++//!   bytes (its identity is theirs).
++//! - **Relying on the driver, checked** ([`check_class`]), as upstream's sampled case does: per
++//!   class of pages, on a thread of its own, for each of [`SHAPES`] (1, 4, 8 and 16-byte texels,
++//!   rows apart and one after another, and the 3440x1440 desktop at a 13824-byte pitch) twice: the
++//!   pattern written, a texture of `RenderTarget | ShaderRead` usage made over the pages (the
++//!   product's path), then one internal submission that makes the image's first move from
++//!   `UNDEFINED`, a render pass that loads and stores it over its whole area and clears a
++//!   rectangle inside through `vkCmdClearAttachments`, one whose render area is a second rectangle
++//!   that it clears through its load, and one whose render area is a third that it loads
++//!   `DONT_CARE`, each in `GENERAL` as the runtime renders. A thread of its own writes the
++//!   pattern's complement into every byte that is not a texel (between the rows, after the image),
++//!   paced so its writes run while the device works. Then each such byte must read the CPU's
++//!   write where the CPU wrote it and the pattern elsewhere, the first two rectangles their clear
++//!   values, and every texel outside the three rectangles the pattern. The third rectangle's
++//!   texels are left unchecked (`DONT_CARE`). The verdict is kept for the device's life (no
++//!   record), noted on stderr once.
++//! - **When.** Where the switch is on as the device is made, the check starts then; else at the
++//!   first texture that asks, which waits for it ([`WAIT`] at most; a pending verdict leaves the
++//!   texture a shadow). A device made to fail its in-place check fails this one too.
++//! - **Why it is sound on ANV** (Mesa 26.2.4, the Arrow Lake iGPU it was written for): a linear
++//!   image and an external one get no aux surface (`anv_image.c`: "Disabling aux: external image
++//!   without DRM modifier", and no CCS for linear tiling), so a layout transition, from
++//!   `UNDEFINED` too, touches no memory, and the load and store operations of a pass touch only
++//!   the texels of its render area. The check holds the driver to that (it passed for pages
++//!   imported by their pointer and fresh pages, in 0.25 s; dma-bufs unchecked there).
++//! - **Ordering.** An image in place is keyed as its buffer, and the tracker orders two buffers
++//!   over the same host bytes by their placements (`host_aliases.rs`); under the switch an
++//!   image's use of such a key takes the uses of every byte the key lies over, as a byte use
++//!   does (`host_aliases::augmented`).
++//! - **What differs from the shadow** (the GPU lanes over host pages, `M2V_LANE_IN_PLACE=1`): a
++//!   pass's `Clear` load of the linear image rounds as ANV's linear clears do, one code from the
++//!   optimal image's in places (0.1 into `BGRA8Unorm`: 0x19, where the optimal image and Metal
++//!   write 0x1a; the draws after it blend exactly alike), as upstream's linear images over the
++//!   runtime's own buffers already do; and a read through a second, separate import of the same
++//!   pages (a buffer made after `host_range_remapped`) in the same command buffer as the pass's
++//!   write read about 2% of its texels stale (`surface_aliases`), where the shadow's merge read
++//!   none; in another command buffer or on another queue, fresh. Imports of one surface's pages
++//!   that join (the usual case) read fresh.
++//! - **Cost** (`host_rt_frames.rs`, the Arrow Lake iGPU): a pass into a linear image costs far
++//!   more than into an optimal one (blending 1.5 screens of 3440x1440: 0.66 ms into a `Private`
++//!   texture, 4.9 ms into a linear image in the device's own memory, 5.4 ms in place over host
++//!   pages), where the shadow's copies cost each pass about 1 to 2 ms whatever it draws. So the
++//!   image in place gains most where passes draw a small part of the texture (the simulator's 42
++//!   small passes a frame at 1206x2622: 70 ms of GPU a frame shadowed, 11.5 ms in place) and
++//!   loses where they blend most of it (10 such full-screen passes at 3440x1440: 18.6 ms
++//!   shadowed, 54 ms in place). The switch `host_rt_max_texels` keeps larger textures shadows.
++
++use crate::device::WeakDevice;
++use crate::exit_guard;
++use crate::in_place::{mark_checking, PagesClass, Verdict};
++use crate::in_place_check::{host_page, ClassPages};
++use crate::{release, Device, TextureDescriptor};
++use ash::vk;
++use metal2vulkan::device::HostPageTexturePolicy;
++use metal2vulkan::metal::{PixelFormat, TextureUsage};
++use std::ptr::NonNull;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::Barrier;
++use std::time::{Duration, Instant};
++
++/// The live switch's name.
++pub(crate) const SWITCH: &str = "host_rt_in_place";
++
++/// Whether the switch is on now.
++pub(crate) fn switched() -> bool {
++    crate::live::on(SWITCH, false)
++}
++
++/// The switch `host_rt_max_texels`: where set, a texture of more texels (its width, height and
++/// depth or layers multiplied) stays a shadow. Rendering into a linear image costs a pass on
++/// Intel's GPU far more than into an optimal one (the module docs), where the shadow's copies cost
++/// a texture's every texel at each pass: so small textures and small passes gain most.
++fn max_texels() -> Option<u64> {
++    crate::live::get("host_rt_max_texels").and_then(|v| v.parse().ok())
++}
++
++/// How long a texture's making waits for a verdict the first time it asks.
++const WAIT: Duration = Duration::from_secs(5);
++
++/// How many times each shape is checked in each class.
++const ROUNDS: usize = 2;
++
++/// The bytes of each class's buffer: past half a pooled block (so a buffer of the runtime's own
++/// lies in fresh pages), and room for the desktop's window.
++const BUFFER_BYTES: u64 = 40 << 20;
++
++/// The time between two of the CPU's writes beside the image: the writes of the desktop's
++/// non-texel bytes (about 100,000) then take about 50 ms, past the device's passes.
++const PACE: Duration = Duration::from_nanos(500);
++
++/// A shape the check makes a texture of.
++#[derive(Clone, Copy, Debug)]
++struct Shape {
++    format: PixelFormat,
++    texel: u64,
++    width: u64,
++    height: u64,
++    bytes_per_row: u64,
++    /// The bytes of one texel cleared to `(1, 1, 1, 1)`.
++    one: &'static [u8],
++}
++
++const UNORM8_ONE: [u8; 4] = [0xff; 4];
++const HALF_ONE: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
++const FLOAT_ONE: [u8; 16] = [
++    0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f,
++];
++
++const SHAPES: [Shape; 6] = [
++    shape(PixelFormat::BGRA8Unorm, 4, 64, 16, 256, &UNORM8_ONE),
++    shape(PixelFormat::BGRA8Unorm, 4, 100, 50, 512, &UNORM8_ONE),
++    shape(PixelFormat::R8Unorm, 1, 61, 37, 256, &[0xff]),
++    shape(PixelFormat::RGBA16Float, 8, 33, 17, 512, &HALF_ONE),
++    shape(PixelFormat::RGBA32Float, 16, 20, 9, 512, &FLOAT_ONE),
++    shape(PixelFormat::BGRA8Unorm, 4, 3440, 1440, 13824, &UNORM8_ONE),
++];
++
++const fn shape(
++    format: PixelFormat,
++    texel: u64,
++    width: u64,
++    height: u64,
++    bytes_per_row: u64,
++    one: &'static [u8],
++) -> Shape {
++    Shape {
++        format,
++        texel,
++        width,
++        height,
++        bytes_per_row,
++        one,
++    }
++}
++
++/// A rectangle of texels: x, y, width, height.
++type Rect = [u64; 4];
++
++impl Shape {
++    /// The window the check fills: the texture's rows, then two pages past their last page.
++    fn window(&self, page: u64) -> u64 {
++        (self.bytes_per_row * self.height).next_multiple_of(page) + 2 * page
++    }
++
++    /// The rectangle the load-and-store pass clears inside it (to one).
++    fn cleared_inside(&self) -> Rect {
++        let (w, h) = (self.width, self.height);
++        [w / 4, h / 4, w / 2 - w / 4, h / 2 - h / 4]
++    }
++
++    /// The render area the clear-load pass clears (to zero).
++    fn clear_area(&self) -> Rect {
++        let (w, h) = (self.width, self.height);
++        [w / 2, h / 2, 3 * w / 4 - w / 2, 3 * h / 4 - h / 2]
++    }
++
++    /// The render area the `DONT_CARE`-load pass loads: its texels are not checked.
++    fn dont_care_area(&self) -> Rect {
++        let (w, h) = (self.width, self.height);
++        [0, 3 * h / 4, w / 4, h - 3 * h / 4]
++    }
++
++    /// The bytes of texels in a row.
++    fn row_bytes(&self) -> u64 {
++        self.width * self.texel
++    }
++
++    /// The bytes that are no texel's in a window of `length`: each row's bytes after its texels,
++    /// then every byte after the last row.
++    fn others(&self, length: u64) -> u64 {
++        let rows = self.bytes_per_row * self.height;
++        (self.bytes_per_row - self.row_bytes()) * self.height + (length - rows)
++    }
++
++    /// The offset of the `i`th byte that is no texel's.
++    fn other(&self, i: u64) -> u64 {
++        let pad = self.bytes_per_row - self.row_bytes();
++        let padding = pad * self.height;
++        if i < padding {
++            let (row, at) = (i / pad, i % pad);
++            row * self.bytes_per_row + self.row_bytes() + at
++        } else {
++            self.bytes_per_row * self.height + (i - padding)
++        }
++    }
++
++    /// What the texel byte at `offset` must hold: `Some(Some(byte))` a cleared value,
++    /// `Some(None)` the pattern, `None` unchecked; `Err(())` where it is no texel's.
++    fn texel_due(&self, offset: u64) -> Result<Option<Option<u8>>, ()> {
++        let (row, column) = (offset / self.bytes_per_row, offset % self.bytes_per_row);
++        if row >= self.height || column >= self.row_bytes() {
++            return Err(());
++        }
++        let (x, y) = (column / self.texel, row);
++        let inside = |[rx, ry, rw, rh]: Rect| x >= rx && x < rx + rw && y >= ry && y < ry + rh;
++        let byte = (column % self.texel) as usize;
++        Ok(if inside(self.dont_care_area()) {
++            None
++        } else if inside(self.clear_area()) {
++            Some(Some(0))
++        } else if inside(self.cleared_inside()) {
++            Some(Some(self.one[byte]))
++        } else {
++            Some(None)
++        })
++    }
++}
++
++impl Device {
++    /// Whether a texture over host pages of `class` that renders or writes, of `extent`, is
++    /// taken in place now (the module docs): the switch, the policy, the size switch, and both
++    /// checks' verdicts for the class, each waited for ([`WAIT`]) where pending.
++    pub(crate) fn host_rt_takes(&self, class: PagesClass, extent: [u32; 3]) -> bool {
++        if !switched() {
++            return false;
++        }
++        let texels = extent.iter().map(|&n| u64::from(n.max(1))).product::<u64>();
++        if max_texels().is_some_and(|max| texels > max) {
++            return false;
++        }
++        if self.compile_device().policy().host_page_textures != HostPageTexturePolicy::InPlace {
++            return false;
++        }
++        let first_move = self.in_place_verdict(class);
++        let first_move = match first_move {
++            Verdict::Pending => wait_for(|| self.shared().in_place.verdict(class)),
++            verdict => verdict,
++        };
++        if first_move != Verdict::Passed {
++            return false;
++        }
++        let checks = &self.shared().host_rt;
++        let verdict = match checks.verdict(class) {
++            Verdict::Pending => {
++                self.start_host_rt_checks();
++                wait_for(|| checks.verdict(class))
++            }
++            verdict => verdict,
++        };
++        verdict == Verdict::Passed
++    }
++
++    /// Start the check where the switch is on and the policy takes textures in place: as the
++    /// device is made.
++    pub(crate) fn start_host_rt_checks_if_switched(&self) {
++        let in_place =
++            self.compile_device().policy().host_page_textures == HostPageTexturePolicy::InPlace;
++        if switched() && in_place {
++            self.start_host_rt_checks();
++        }
++    }
++
++    /// Start the check on a thread of its own, where it has not started.
++    fn start_host_rt_checks(&self) {
++        let checks = &self.shared().host_rt;
++        if !checks.start() {
++            return;
++        }
++        let weak = self.downgrade();
++        let builder = std::thread::Builder::new().name("m2v-rt-check".to_owned());
++        if exit_guard::spawn(builder, move || run(weak)).is_err() {
++            for class in PagesClass::ALL {
++                if checks.verdict(class) == Verdict::Pending {
++                    checks.set(class, Verdict::Unchecked);
++                }
++            }
++            checks.settle(None);
++        }
++    }
++
++    /// macbox: start the render-target check where it has not started (whatever the
++    /// switch), and wait until every verdict is known or `timeout` passed: whether they are. A
++    /// runtime extension for the lanes.
++    #[doc(hidden)]
++    pub fn settle_host_rt_checks(&self, timeout: Duration) -> bool {
++        self.start_host_rt_checks();
++        self.shared().host_rt.wait(timeout)
++    }
++
++    /// macbox: the render-target check's verdicts now, one line per class, its notes, and
++    /// its time where it ended. A runtime extension for the lanes.
++    #[doc(hidden)]
++    pub fn host_rt_check_report(&self) -> Vec<String> {
++        report(self)
++    }
++}
++
++/// `verdict`'s answer once it is not pending, or after [`WAIT`].
++fn wait_for(verdict: impl Fn() -> Verdict) -> Verdict {
++    let deadline = Instant::now() + WAIT;
++    loop {
++        let now = verdict();
++        if now != Verdict::Pending || Instant::now() >= deadline {
++            return now;
++        }
++        std::thread::sleep(Duration::from_millis(2));
++    }
++}
++
++/// The check's verdicts, notes and time, a line each.
++fn report(device: &Device) -> Vec<String> {
++    let checks = &device.shared().host_rt;
++    let mut lines: Vec<String> = PagesClass::ALL
++        .into_iter()
++        .map(|class| format!("{class:?}: {:?}", checks.verdict(class)))
++        .collect();
++    lines.extend(checks.notes());
++    if let Some(took) = checks.took() {
++        lines.push(format!("took {took:?}"));
++    }
++    lines
++}
++
++/// The check's thread: each class in turn, its verdict given as it is known.
++fn run(weak: WeakDevice) {
++    mark_checking();
++    let started = Instant::now();
++    for class in PagesClass::ALL {
++        let Some(device) = weak.upgrade() else {
++            return;
++        };
++        if device.shared().host_rt.verdict(class) != Verdict::Pending {
++            continue;
++        }
++        let Some(verdict) = check_class(&device, class) else {
++            return;
++        };
++        device.shared().host_rt.set(class, verdict);
++    }
++    let Some(device) = weak.upgrade() else {
++        return;
++    };
++    device.shared().host_rt.settle(Some(started.elapsed()));
++    let line = format!(
++        "metal2vulkan host_rt: render-target check: {}\n",
++        report(&device).join("; ")
++    );
++    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
++}
++
++/// What one round found.
++enum Round {
++    /// Every byte read as due.
++    Kept,
++    /// The texture took no image in place, or the passes were not made: why.
++    NotMade(String),
++    /// A byte read other than due: where, what was due, what was read, and the step.
++    Changed(u64, u8, u8, &'static str),
++}
++
++/// The verdict of `class` on `device`: every shape's rounds, until one fails. `None` where the
++/// process is exiting.
++fn check_class(device: &Device, class: PagesClass) -> Option<Verdict> {
++    let page = host_page();
++    let pages = {
++        let _busy = exit_guard::enter()?;
++        ClassPages::make(device, class, BUFFER_BYTES)
++    };
++    let Some(pages) = pages else {
++        return Some(Verdict::Unchecked);
++    };
++    let checks = &device.shared().host_rt;
++    let mut made = 0;
++    for shape in SHAPES {
++        if shape.window(page) > BUFFER_BYTES {
++            continue;
++        }
++        for round in 0..ROUNDS {
++            let outcome = {
++                let _busy = exit_guard::enter()?;
++                check_round(device, &pages, &shape, round, page)
++            };
++            match outcome {
++                Round::Kept => made += 1,
++                Round::NotMade(why) => {
++                    checks.note(format!(
++                        "{class:?}: no {:?} {}x{} image in place with rows {} bytes apart: {why}",
++                        shape.format, shape.width, shape.height, shape.bytes_per_row
++                    ));
++                    break;
++                }
++                Round::Changed(offset, due, read, step) => {
++                    checks.note(format!(
++                        "{class:?}: a {:?} image of {}x{} with rows {} bytes apart: byte \
++                         {offset} ({step}) read {read:#04x} where {due:#04x} was due, round \
++                         {round}",
++                        shape.format, shape.width, shape.height, shape.bytes_per_row
++                    ));
++                    return Some(Verdict::Failed);
++                }
++            }
++        }
++    }
++    Some(match (made, checks.forced_failure()) {
++        (0, _) => Verdict::Unchecked,
++        (_, true) => Verdict::Failed,
++        (_, false) => Verdict::Passed,
++    })
++}
++
++/// One round of `shape` over `pages` (the module docs).
++fn check_round(
++    device: &Device,
++    pages: &ClassPages,
++    shape: &Shape,
++    round: usize,
++    page: u64,
++) -> Round {
++    let window = Window {
++        start: pages.start,
++        length: shape.window(page),
++        shape: *shape,
++        salt: round as u64 + 1,
++    };
++    window.fill();
++    let mut descriptor =
++        TextureDescriptor::texture_2d(shape.format, shape.width, shape.height, false);
++    descriptor.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    let texture = match pages
++        .buffer
++        .new_texture(&descriptor, 0, shape.bytes_per_row)
++    {
++        Ok(texture) => texture,
++        Err(error) => return Round::NotMade(format!("{error:?}")),
++    };
++    let Some((image, format, usage, key)) = texture.in_place_target() else {
++        return Round::NotMade("a shadow".to_owned());
++    };
++    if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
++        return Round::NotMade(format!("its image's usage is {:#x}", usage.as_raw()));
++    }
++    let passes = match Passes::make(device, image, format, shape) {
++        Ok(passes) => passes,
++        Err(error) => return Round::NotMade(format!("its passes: {error:?}")),
++    };
++    let stop = AtomicBool::new(false);
++    let started = Barrier::new(2);
++    let written = AtomicU64::new(0);
++    let submitted = std::thread::scope(|scope| {
++        let builder = std::thread::Builder::new().name("m2v-rt-writes".to_owned());
++        let writer = exit_guard::spawn_scoped(scope, builder, || {
++            window.write_until(&stop, &started, &written);
++        });
++        if writer.is_err() {
++            return None;
++        }
++        started.wait();
++        // SAFETY (of the recording): the internal command buffer records outside a render pass;
++        // the image's first move goes first in it (its key named), and every object `passes`
++        // holds lives until the submission completed (the call waits for it).
++        let done = device.submit_internal_naming(
++            |named| named == key,
++            |raw, command_buffer| unsafe { passes.record(raw, command_buffer, shape) },
++        );
++        stop.store(true, Ordering::Release);
++        Some(done)
++    });
++    passes.release(device);
++    drop(texture);
++    match submitted {
++        Some(Ok(())) => {}
++        Some(Err(error)) => return Round::NotMade(format!("its submission: {error:?}")),
++        None => return Round::NotMade("no writer thread".to_owned()),
++    }
++    match window.compare(written.load(Ordering::Acquire)) {
++        None => Round::Kept,
++        Some((offset, due, read, step)) => Round::Changed(offset, due, read, step),
++    }
++}
++
++/// The view, render passes and framebuffer of one round.
++struct Passes {
++    view: vk::ImageView,
++    /// Loads `LOAD`, `CLEAR` and `DONT_CARE`, each storing.
++    passes: [vk::RenderPass; 3],
++    framebuffer: vk::Framebuffer,
++}
++
++impl Passes {
++    fn make(
++        device: &Device,
++        image: vk::Image,
++        format: vk::Format,
++        shape: &Shape,
++    ) -> Result<Passes, crate::error::Error> {
++        let raw = device.shared().vk();
++        let mut view_usage =
++            vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
++        let info = vk::ImageViewCreateInfo::default()
++            .image(image)
++            .view_type(vk::ImageViewType::TYPE_2D)
++            .format(format)
++            .subresource_range(vk::ImageSubresourceRange {
++                aspect_mask: vk::ImageAspectFlags::COLOR,
++                base_mip_level: 0,
++                level_count: 1,
++                base_array_layer: 0,
++                layer_count: 1,
++            })
++            .push_next(&mut view_usage);
++        // SAFETY: the device is live; the image is its own, of color attachment usage.
++        let view =
++            unsafe { crate::creation::image_view(raw, &info) }.map_err(crate::error::vulkan)?;
++        let mut made = Passes {
++            view,
++            passes: [vk::RenderPass::null(); 3],
++            framebuffer: vk::Framebuffer::null(),
++        };
++        let loads = [
++            vk::AttachmentLoadOp::LOAD,
++            vk::AttachmentLoadOp::CLEAR,
++            vk::AttachmentLoadOp::DONT_CARE,
++        ];
++        for (slot, load) in made.passes.iter_mut().zip(loads) {
++            let attachments = [vk::AttachmentDescription::default()
++                .format(format)
++                .samples(vk::SampleCountFlags::TYPE_1)
++                .load_op(load)
++                .store_op(vk::AttachmentStoreOp::STORE)
++                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
++                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
++                .initial_layout(vk::ImageLayout::GENERAL)
++                .final_layout(vk::ImageLayout::GENERAL)];
++            let colors = [vk::AttachmentReference {
++                attachment: 0,
++                layout: vk::ImageLayout::GENERAL,
++            }];
++            let subpasses = [vk::SubpassDescription::default()
++                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
++                .color_attachments(&colors)];
++            let info = vk::RenderPassCreateInfo::default()
++                .attachments(&attachments)
++                .subpasses(&subpasses);
++            // SAFETY: the device is live and the description valid.
++            match unsafe { crate::creation::render_pass(raw, &info) } {
++                Ok(pass) => *slot = pass,
++                Err(error) => {
++                    made.release(device);
++                    return Err(error);
++                }
++            }
++        }
++        let views = [made.view];
++        let info = vk::FramebufferCreateInfo::default()
++            .render_pass(made.passes[0])
++            .attachments(&views)
++            .width(shape.width as u32)
++            .height(shape.height as u32)
++            .layers(1);
++        // SAFETY: the device is live; the view is of the pass's attachment's format, one level and
++        // layer of its image's extent.
++        match unsafe { crate::creation::framebuffer(raw, &info) } {
++            Ok(framebuffer) => made.framebuffer = framebuffer,
++            Err(error) => {
++                made.release(device);
++                return Err(error);
++            }
++        }
++        Ok(made)
++    }
++
++    /// Record the three passes (the module docs), between barriers, the last to the host.
++    ///
++    /// # Safety
++    ///
++    /// `command_buffer` is recording outside a render pass, after the image's first move; the
++    /// objects live until it completed.
++    unsafe fn record(&self, raw: &ash::Device, command_buffer: vk::CommandBuffer, shape: &Shape) {
++        let barrier = |dst_stage, dst_access| {
++            let memory = [vk::MemoryBarrier::default()
++                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
++                .dst_access_mask(dst_access)];
++            // SAFETY: the caller's; outside a render pass.
++            unsafe {
++                raw.cmd_pipeline_barrier(
++                    command_buffer,
++                    vk::PipelineStageFlags::ALL_COMMANDS,
++                    dst_stage,
++                    vk::DependencyFlags::empty(),
++                    &memory,
++                    &[],
++                    &[],
++                )
++            };
++        };
++        let all = vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
++        let rect = |[x, y, w, h]: Rect| vk::Rect2D {
++            offset: vk::Offset2D {
++                x: x as i32,
++                y: y as i32,
++            },
++            extent: vk::Extent2D {
++                width: w as u32,
++                height: h as u32,
++            },
++        };
++        let whole = rect([0, 0, shape.width, shape.height]);
++        let one = vk::ClearValue {
++            color: vk::ClearColorValue { float32: [1.0; 4] },
++        };
++        let zero = vk::ClearValue {
++            color: vk::ClearColorValue { float32: [0.0; 4] },
++        };
++        barrier(vk::PipelineStageFlags::ALL_COMMANDS, all);
++        // Load and store over the whole area, a rectangle cleared inside.
++        let begin = vk::RenderPassBeginInfo::default()
++            .render_pass(self.passes[0])
++            .framebuffer(self.framebuffer)
++            .render_area(whole);
++        let clears = [vk::ClearAttachment {
++            aspect_mask: vk::ImageAspectFlags::COLOR,
++            color_attachment: 0,
++            clear_value: one,
++        }];
++        let rects = [vk::ClearRect {
++            rect: rect(shape.cleared_inside()),
++            base_array_layer: 0,
++            layer_count: 1,
++        }];
++        // SAFETY: the caller's; the pass, framebuffer and rectangle are of the image's extent.
++        unsafe {
++            raw.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
++            raw.cmd_clear_attachments(command_buffer, &clears, &rects);
++            raw.cmd_end_render_pass(command_buffer);
++        }
++        barrier(vk::PipelineStageFlags::ALL_COMMANDS, all);
++        // A clear load over a second rectangle.
++        let values = [zero];
++        let begin = vk::RenderPassBeginInfo::default()
++            .render_pass(self.passes[1])
++            .framebuffer(self.framebuffer)
++            .render_area(rect(shape.clear_area()))
++            .clear_values(&values);
++        // SAFETY: as above.
++        unsafe {
++            raw.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
++            raw.cmd_end_render_pass(command_buffer);
++        }
++        barrier(vk::PipelineStageFlags::ALL_COMMANDS, all);
++        // A `DONT_CARE` load over a third.
++        let begin = vk::RenderPassBeginInfo::default()
++            .render_pass(self.passes[2])
++            .framebuffer(self.framebuffer)
++            .render_area(rect(shape.dont_care_area()));
++        // SAFETY: as above.
++        unsafe {
++            raw.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
++            raw.cmd_end_render_pass(command_buffer);
++        }
++        barrier(vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ);
++    }
++
++    /// Destroy what was made; nothing uses it.
++    fn release(&self, device: &Device) {
++        let raw = device.shared().vk();
++        // SAFETY: the objects are this device's, and no pending command uses them.
++        unsafe {
++            if self.framebuffer != vk::Framebuffer::null() {
++                release::object(raw, self.framebuffer);
++            }
++            for &pass in &self.passes {
++                if pass != vk::RenderPass::null() {
++                    release::object(raw, pass);
++                }
++            }
++            release::object(raw, self.view);
++        }
++    }
++}
++
++/// A round's window of a class's pages, from its byte 0, and what it holds.
++#[derive(Clone, Copy)]
++struct Window {
++    start: NonNull<u8>,
++    length: u64,
++    shape: Shape,
++    salt: u64,
++}
++
++// SAFETY: the window's pages stay mapped while the round uses them (its buffer holds them), and
++// the writer thread writes only bytes the round's thread does not touch until it joined it.
++unsafe impl Send for Window {}
++// SAFETY: as above.
++unsafe impl Sync for Window {}
++
++impl Window {
++    /// The pattern's byte at `offset`: a hash of its place and the round.
++    fn pattern(&self, offset: u64) -> u8 {
++        let mixed = (offset ^ self.salt.rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
++        (mixed >> 56) as u8
++    }
++
++    fn byte(&self, offset: u64) -> *mut u8 {
++        // SAFETY: the offset lies in the window, whose pages are mapped.
++        unsafe { self.start.as_ptr().add(offset as usize) }
++    }
++
++    /// Fill the window with the pattern.
++    fn fill(&self) {
++        // SAFETY: the window's bytes, mapped and writable; nothing else touches them meanwhile.
++        let bytes = unsafe { std::slice::from_raw_parts_mut(self.byte(0), self.length as usize) };
++        for (offset, byte) in bytes.iter_mut().enumerate() {
++            *byte = self.pattern(offset as u64);
++        }
++    }
++
++    /// The stride the writer walks the bytes that are no texel's at: coprime with their count.
++    fn stride(&self) -> u64 {
++        let count = self.shape.others(self.length);
++        let coprime = |mut a: u64, mut b: u64| {
++            while b != 0 {
++                (a, b) = (b, a % b);
++            }
++            a == 1
++        };
++        (1_000_003u64..)
++            .step_by(2)
++            .find(|&stride| coprime(stride, count))
++            .unwrap_or(1)
++    }
++
++    /// The offset of the `n`th byte the writer writes.
++    fn nth(&self, n: u64, stride: u64) -> u64 {
++        let count = self.shape.others(self.length);
++        let i = (u128::from(n) * u128::from(stride) % u128::from(count)) as u64;
++        self.shape.other(i)
++    }
++
++    /// Write the pattern's complement into each byte that is no texel's once, paced, until
++    /// `stop` or every one is written; `started` once the first is.
++    fn write_until(&self, stop: &AtomicBool, started: &Barrier, written: &AtomicU64) {
++        let (count, stride) = (self.shape.others(self.length), self.stride());
++        let begun = Instant::now();
++        let mut n = 0;
++        while n < count && (n == 0 || !stop.load(Ordering::Acquire)) {
++            let offset = self.nth(n, stride);
++            // SAFETY: a byte of the window no texel holds; the round's thread does not touch it
++            // until it joined this one.
++            unsafe { self.byte(offset).write_volatile(!self.pattern(offset)) };
++            n += 1;
++            if n == 1 {
++                started.wait();
++            }
++            while begun.elapsed() < PACE * n as u32 && !stop.load(Ordering::Relaxed) {
++                std::hint::spin_loop();
++            }
++        }
++        if n == 0 {
++            started.wait();
++        }
++        written.store(n, Ordering::Release);
++    }
++
++    /// The first byte that reads other than due, where the writer wrote `written`: its offset,
++    /// what was due, what was read, and which step.
++    fn compare(&self, written: u64) -> Option<(u64, u8, u8, &'static str)> {
++        let stride = self.stride();
++        for n in 0..written {
++            let offset = self.nth(n, stride);
++            let due = !self.pattern(offset);
++            // SAFETY: the writer was joined.
++            let read = unsafe { self.byte(offset).read_volatile() };
++            if read != due {
++                return Some((offset, due, read, "the CPU's write beside the image"));
++            }
++            // SAFETY: as above.
++            unsafe { self.byte(offset).write_volatile(self.pattern(offset)) };
++        }
++        // SAFETY: as above; nothing writes the bytes while they are read.
++        let bytes = unsafe { std::slice::from_raw_parts(self.byte(0), self.length as usize) };
++        for (offset, &read) in bytes.iter().enumerate() {
++            let offset = offset as u64;
++            let (due, step) = match self.shape.texel_due(offset) {
++                Err(()) => (self.pattern(offset), "a byte beside the image"),
++                Ok(None) => continue,
++                Ok(Some(None)) => (self.pattern(offset), "a texel no pass wrote"),
++                Ok(Some(Some(value))) => (value, "a cleared texel"),
++            };
++            if read != due {
++                return Some((offset, due, read, step));
++            }
++        }
++        None
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
+index 86f42373..420c9ac5 100644
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -302,6 +302,12 @@ impl InPlaceChecks {
+         lock(&self.notes).push(line);
+     }
+ 
++    // macbox: the render-target check's report (`host_rt.rs`).
++    /// What the check noted, a line each.
++    pub(crate) fn notes(&self) -> Vec<String> {
++        lock(&self.notes).clone()
++    }
++
+     /// `class`'s verdict now.
+     pub(crate) fn verdict(&self, class: PagesClass) -> Verdict {
+         let byte = self.verdicts[class.index()].load(Ordering::Acquire);
+diff --git a/crates/metal2vulkan-runtime/src/in_place_check.rs b/crates/metal2vulkan-runtime/src/in_place_check.rs
+index 46645681..d0c60be3 100644
+--- a/crates/metal2vulkan-runtime/src/in_place_check.rs
++++ b/crates/metal2vulkan-runtime/src/in_place_check.rs
+@@ -272,15 +272,16 @@ fn check_round(pages: &ClassPages, shape: Shape, round: usize, page: u64) -> Rou
+ }
+ 
+ /// The pages of one class's check: its buffer, and the host address of its byte 0.
+-struct ClassPages {
+-    buffer: Buffer,
+-    start: NonNull<u8>,
++// macbox: crate-visible for the render-target check (`host_rt.rs`).
++pub(crate) struct ClassPages {
++    pub(crate) buffer: Buffer,
++    pub(crate) start: NonNull<u8>,
+ }
+ 
+ impl ClassPages {
+     /// A buffer of `length` bytes in pages of `class` on `device`, where the device makes one
+     /// there; inside a section of its own.
+-    fn make(device: &Device, class: PagesClass, length: u64) -> Option<ClassPages> {
++    pub(crate) fn make(device: &Device, class: PagesClass, length: u64) -> Option<ClassPages> {
+         let _busy = exit_guard::enter()?;
+         match class {
+             PagesClass::Pointer => pointer_pages(device, length),
+@@ -539,7 +540,8 @@ impl Bytes {
+ }
+ 
+ /// The host's page size.
+-fn host_page() -> u64 {
++// macbox: crate-visible for the render-target check (`host_rt.rs`).
++pub(crate) fn host_page() -> u64 {
+     #[cfg(unix)]
+     {
+         // SAFETY: a query of the page size, with no argument.
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 27ef226b..ca076571 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -120,6 +120,8 @@ mod host_bytes;
+ mod host_memory;
+ #[cfg(unix)]
+ mod host_residency;
++/// macbox: textures over host pages that render or write, in place (`host_rt_in_place`).
++mod host_rt;
+ #[cfg(unix)]
+ mod host_shared_pointers;
+ mod image_barrier;
+diff --git a/crates/metal2vulkan-runtime/src/live.rs b/crates/metal2vulkan-runtime/src/live.rs
+index cc6e810b..1867b257 100644
+--- a/crates/metal2vulkan-runtime/src/live.rs
++++ b/crates/metal2vulkan-runtime/src/live.rs
+@@ -46,7 +46,9 @@ fn live() -> Option<&'static Live> {
+ 
+ impl Live {
+     fn refresh(&self) {
+-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
++        let mtime = std::fs::metadata(&self.path)
++            .and_then(|m| m.modified())
++            .ok();
+         if *self.mtime.read().unwrap() == mtime && mtime.is_some() {
+             return;
+         }
+@@ -79,8 +81,25 @@ impl Live {
+     }
+ }
+ 
+-/// The switch `name`'s value, where the file sets it.
++/// Switches set in the process ([`set`]), over the file's.
++static SET: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
++
++/// Set the switch `name` to `value` in this process, over the file's (`None` lets the file's
++/// answer again): for a lane that weighs both settings in one run.
++#[doc(hidden)]
++pub fn set(name: &str, value: Option<&str>) {
++    let mut set = SET.write().unwrap();
++    match value {
++        Some(value) => set.insert(name.to_owned(), value.to_owned()),
++        None => set.remove(name),
++    };
++}
++
++/// The switch `name`'s value, where [`set`] or the file sets it.
+ pub fn get(name: &str) -> Option<String> {
++    if let Some(value) = SET.read().unwrap().get(name) {
++        return Some(value.clone());
++    }
+     live()?.values().get(name).cloned()
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 0eb14cb2..10e313a1 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2212,6 +2212,38 @@ impl Device {
+                                 Err((refusal, why)) => ShadowCause::Refused(refusal, why),
+                             }
+                         }
++                        // macbox: a texture that renders or writes, in place, where the
++                        // switch `host_rt_in_place` is on and the device's render-target check
++                        // passed for the class (`host_rt.rs`); the check's own textures always.
++                        Err(ShadowCause::RenderTarget | ShadowCause::ShaderWrite)
++                            if checking || self.host_rt_takes(class, layout.extent) =>
++                        {
++                            let plans = host_rt_plans(self, &plan, layout, usage, &facts)?;
++                            let mut refused = None;
++                            for tried in &plans {
++                                let made =
++                                    self.in_place_image(tried, descriptor, &texels, class, &facts)?;
++                                match made {
++                                    Ok((image, pitched)) => {
++                                        if !checking {
++                                            let counts = &self.shared().counts;
++                                            counts.host_texture_in_place(class, pitched);
++                                            if tried.usage.contains(
++                                                ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT,
++                                            ) {
++                                                counts.feedback_loop_alias_image();
++                                            }
++                                        }
++                                        return Ok(Storage::Alias { image, texels });
++                                    }
++                                    Err(why) => refused = Some(why),
++                                }
++                            }
++                            match refused {
++                                Some((refusal, why)) => ShadowCause::Refused(refusal, why),
++                                None => ShadowCause::RenderTarget,
++                            }
++                        }
+                         Err(cause) => cause,
+                     }
+                 };
+@@ -2284,6 +2316,14 @@ impl Device {
+         {
+             return Err(Error::NotImplemented(RuntimeGap::Textures));
+         }
++        // macbox: where the switch `shadow_compressed` is on, a shadow planned mutable to
++        // any format takes the list of the formats its own image is viewed as
++        // (`shadow_compressible`), so a driver that compresses only images of a known list of
++        // compatible formats may compress it (ANV: "Disabling aux: CCS_E incompatible format(s)").
++        let plan = match crate::live::on("shadow_compressed", false) {
++            true => shadow_compressible(plan, layout, usage, &facts),
++            false => plan,
++        };
+         // Where the device copies a shadow back faster by a dispatch, the image takes the
+         // integer view the dispatch reads (`shadow_copy_back.rs`).
+         let (plan, word) = match shadow_copy_back::dispatches(self) {
+@@ -2296,6 +2336,21 @@ impl Device {
+             Some(_) => (plan, None),
+             None => with_unorm_view(plan, &facts),
+         };
++        // macbox diagnostic: the shadow's plan, where `M2V_SHADOW_PLANS` is set.
++        if std::env::var_os("M2V_SHADOW_PLANS").is_some() {
++            eprintln!(
++                "metal2vulkan shadow plan: {:?} {:?} {}x{} flags {:?} usage {:?} views {:?} \
++                 families {}",
++                descriptor.pixel_format,
++                plan.format,
++                plan.extent[0],
++                plan.extent[1],
++                plan.flags,
++                plan.usage,
++                plan.view_formats,
++                self.shared().sharing().families().len()
++            );
++        }
+         let hazard = texels.options().hazard_tracking_mode()?;
+         // A depth or stencil texture over a surface's plane copies the aspect the plane holds
+         // alone (`copy_plan::surface_depth_unit`); its image's other aspect stays the zeros it
+@@ -6009,3 +6064,56 @@ impl Upload<'_> {
+         }
+     }
+ }
++
++/// macbox: the plans an image in place of a texture over host pages that renders or
++/// writes is tried with (`host_rt.rs`), the first the device makes: as a linear image aliasing a
++/// buffer of the runtime's own is (`Device::storage_over_buffer`'s `None` branch): with the
++/// feedback loop usage, then with the usage the texture lacks, then with its own plan. A linear
++/// image is never compressed, and its memory is the pages', so the wider usage costs it nothing.
++fn host_rt_plans(
++    device: &Device,
++    plan: &ImagePlan,
++    layout: &TextureLayout,
++    usage: TextureUsage,
++    facts: &ImageFacts<'_>,
++) -> Result<Vec<ImagePlan>, Error> {
++    let wider = undeclared_usage(plan.clone(), layout, usage, facts, |_, w| Ok(w))?;
++    let mut plans: Vec<ImagePlan> = feedback_candidate(&wider, device).into_iter().collect();
++    if wider != *plan {
++        plans.push(wider);
++    }
++    plans.push(plan.clone());
++    Ok(plans)
++}
++
++/// macbox: `plan`, a shadow's image, with the list of the formats the runtime views its own
++/// image as where it is mutable to any format (a texture of `PixelFormatView` usage, or one Metal
++/// keeps uncompressed): the list a plan of the texture's usage without `PixelFormatView` takes, or
++/// its own format alone. A view of a texture over a buffer in another pixel format is a texture of
++/// its own over the same bytes, with an image (or shadow) of its own (`Texture::view_storage`), so
++/// no view of another format is ever made of the shadow's image; the runtime's own views of it
++/// (its sRGB twin, a storage alias, the copies' word view, added after) are those the list holds.
++/// The shadow's compression is not observable: every byte of the texture reaches the buffer
++/// through its copies. Any other plan is returned as it is.
++fn shadow_compressible(
++    mut plan: ImagePlan,
++    layout: &TextureLayout,
++    usage: TextureUsage,
++    facts: &ImageFacts<'_>,
++) -> ImagePlan {
++    let mutable = metal2vulkan::vk::ImageCreateFlags::MUTABLE_FORMAT;
++    if !plan.flags.contains(mutable) || !plan.view_formats.is_empty() {
++        return plan;
++    }
++    let own = plan_image(
++        layout,
++        usage.difference(TextureUsage::PIXEL_FORMAT_VIEW),
++        false,
++        facts,
++    );
++    plan.view_formats = match own {
++        Ok(own) if own.view_formats.first() == Some(&plan.format) => own.view_formats,
++        _ => vec![plan.format],
++    };
++    plan
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+index 3ceaa484..7bff410a 100644
+--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+@@ -65,6 +65,28 @@ impl Texture {
+             _ => None,
+         }
+     }
++
++    // macbox: the render-target check's view of its texture (`host_rt.rs`).
++    /// The texture's image in place, where it is one: its `VkImage`, its format, its usage and its
++    /// hazard key (the submission that names the key makes the image's first move).
++    pub(crate) fn in_place_target(
++        &self,
++    ) -> Option<(
++        vk::Image,
++        vk::Format,
++        vk::ImageUsageFlags,
++        crate::resource::ResourceKey,
++    )> {
++        match &self.0.storage {
++            Storage::Alias { image, .. } => Some((
++                image.raw.get(),
++                image.plan().format.into(),
++                image.plan().usage.into(),
++                image.identity.key,
++            )),
++            _ => None,
++        }
++    }
+ }
+ 
+ impl Device {
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane.rs b/crates/metal2vulkan-validation/src/runtime_lane.rs
+index 2ff62202..c2394df6 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane.rs
+@@ -471,6 +471,7 @@ mod grouped_submissions;
+ mod guarded_effects;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
+ mod guest_frame_costs;
++// macbox: the desktop's frames under the host-page render-target switches.
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ mod half_output_blends;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+@@ -515,6 +516,8 @@ mod host_contract;
+ mod host_copied_textures;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ mod host_memory;
++#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
++mod host_rt_frames;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ mod in_place_textures;
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+@@ -921,6 +924,12 @@ pub(crate) fn made_lane_device(
+ ) -> Result<Device, String> {
+     fatal_signals::install();
+     let mut options = validated_options(messages, cache);
++    // macbox: `M2V_LANE_IN_PLACE=1` gives every lane device the product's policy for
++    // textures over host pages (`HostPageTexturePolicy::InPlace`) before the lane's own options,
++    // so the lanes over host pages exercise the in-place paths (`host_rt_in_place` among them).
++    if std::env::var_os("M2V_LANE_IN_PLACE").is_some_and(|v| v == "1") {
++        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlace;
++    }
+     adjust(&mut options);
+     LaneChecks::switched().apply(&mut options);
+     // The layers the device finally asks for, after `adjust`: what a layer-dependent claim of this
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs b/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
+new file mode 100644
+index 00000000..d1c701b0
+--- /dev/null
++++ b/crates/metal2vulkan-validation/src/runtime_lane/host_rt_frames.rs
+@@ -0,0 +1,485 @@
++//! macbox: what a desktop frame of render passes into a texture over host pages costs on
++//! the device the cfg selects, under each setting of the live switches `host_rt_in_place` and
++//! `shadow_compressed` (`metal2vulkan_runtime::live`): report only, in release builds.
++//!
++//! The surface is the macOS desktop's framebuffer as the VM's WindowServer renders it: a
++//! 3440x1440 `BGRA8Unorm` IOSurface plane with rows of 13824 bytes (64 past its 13760 bytes of
++//! texels) over anonymous pages, a `Managed` no-copy buffer over them and a texture of the plane of
++//! `RenderTarget | ShaderRead` usage, on a device that takes textures over host pages in place
++//! (`HostPageTexturePolicy::InPlace`, the product's). A frame is 10 render passes ([`Shape`]), each
++//! loading and storing the texture and blending three rectangles (the whole surface, then two
++//! quarters): in one command buffer (`Passes`), or each in its own (`PassesApart`), as the guest
++//! commits them. Each setting runs on a device of its own, the texture made after the switches
++//! changed, the settings interleaved in two rounds.
++//!
++//! `SimSmallApart` is the iOS Simulator's screen at 3x instead (1206x2622, rows of 4864 bytes), 42
++//! passes a frame of a small rectangle each, a command buffer each; `Private` and `LinearOwn` take
++//! the desktop's passes apart (an optimal texture of the device's own, a linear one).
++//!
++//! Printed per round, shape and setting (`HOST-RT-FRAME`): the texture's form, the medians and
++//! 90th percentiles of the frame's GPU time (each command buffer's `GPUEndTime` less
++//! `GPUStartTime`, summed) and of its commit to completion, and the shadow's work per frame.
++//! Checked: every setting leaves the same bytes in the pages, the texels and the bytes between
++//! the rows (a sentinel no pass may write), as the shadow does.
++
++use super::first_use_writes::CHECK_WAIT;
++use super::host_memory::Mapping;
++use super::no_copy_textures::{blending, floats, staged};
++use super::{validated_device_with, Messages, ScratchCache, WAIT};
++use crate::gpu::TEST_DEVICE;
++use metal2vulkan::device::HostPageTexturePolicy;
++use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan_runtime::{
++    live, Buffer, CommandBuffer, CpuCacheMode, Device, HazardTrackingMode, HostMemory,
++    IoSurfacePlane, LoadAction, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
++    StorageMode, StoreAction, Texture, TextureDescriptor, WorkCounts,
++};
++use std::time::Instant;
++
++const WARM: usize = 10;
++const FRAMES: usize = 40;
++
++/// What a frame does.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Shape {
++    /// The desktop (3440x1440, rows of 13824 bytes): one command buffer, 10 passes into the
++    /// surface's texture, an encoder each, each blending the whole surface and two quarters.
++    Passes,
++    /// As [`Shape::Passes`], the texture also of `PixelFormatView` usage (a shadow planned
++    /// mutable to any format: the case `shadow_compressed` changes).
++    PassesViews,
++    /// The desktop: 10 command buffers of one such pass each.
++    PassesApart,
++    /// The desktop: 10 command buffers of one pass each, each blending one rectangle of a
++    /// sixteenth of the surface (its middle), with no scissor: a window's update.
++    SmallApart,
++    /// The iOS Simulator's screen at 3x (1206x2622, rows of 4864 bytes): 42 command buffers of
++    /// one pass each blending a sixteenth of it, as the coordinator measured the sim's frames.
++    SimSmallApart,
++}
++
++impl Shape {
++    /// Width, height, bytes per row, passes per frame, a command buffer per pass, small rects.
++    fn of(self) -> (u64, u64, u64, usize, bool, bool) {
++        match self {
++            Shape::Passes | Shape::PassesViews => (3440, 1440, 13824, 10, false, false),
++            Shape::PassesApart => (3440, 1440, 13824, 10, true, false),
++            Shape::SmallApart => (3440, 1440, 13824, 10, true, true),
++            Shape::SimSmallApart => (1206, 2622, 4864, 42, true, true),
++        }
++    }
++}
++
++const SHAPES: [Shape; 5] = [
++    Shape::Passes,
++    Shape::PassesViews,
++    Shape::PassesApart,
++    Shape::SmallApart,
++    Shape::SimSmallApart,
++];
++
++/// The switches' settings weighed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Setting {
++    /// Both off: today's shadow, copied in and merged back.
++    Shadow,
++    /// `host_rt_in_place`: the texture in place.
++    InPlace,
++    /// `shadow_compressed`: the shadow, its image eligible for the driver's compression.
++    Compressed,
++    /// For the parts: the passes into a `Private` texture of the surface's size (optimal tiling,
++    /// the device's own memory), no shadow.
++    Private,
++    /// For the parts: the passes into a linear image over a `Private` buffer's bytes, rows of
++    /// 13760 bytes (packed), aliased: linear tiling in the device's own memory.
++    LinearOwn,
++}
++
++impl Setting {
++    fn switches(self) -> [(&'static str, &'static str); 2] {
++        let on = |yes: bool| if yes { "1" } else { "0" };
++        [
++            ("host_rt_in_place", on(self == Setting::InPlace)),
++            ("shadow_compressed", on(self == Setting::Compressed)),
++        ]
++    }
++}
++
++const SETTINGS: [Setting; 5] = [
++    Setting::Shadow,
++    Setting::InPlace,
++    Setting::Compressed,
++    Setting::Private,
++    Setting::LinearOwn,
++];
++
++fn median_p90(mut values: Vec<f64>) -> (f64, f64) {
++    values.sort_by(f64::total_cmp);
++    let at = |p: usize| values[(values.len() * p / 100).min(values.len() - 1)];
++    (at(50), at(90))
++}
++
++fn surface_buffer(device: &Device, mapping: &Mapping, len: usize) -> Buffer {
++    let managed = ResourceOptions::new(
++        StorageMode::Managed,
++        CpuCacheMode::DefaultCache,
++        HazardTrackingMode::Default,
++    );
++    // SAFETY: the mapping outlives every buffer over it (the test drops them first).
++    let memory = unsafe { HostMemory::new(mapping.pointer()) };
++    // SAFETY: as above.
++    unsafe { device.new_buffer_with_bytes_no_copy(memory, len as u64, managed, None) }.unwrap()
++}
++
++fn plane_texture(buffer: &Buffer, shape: Shape) -> Texture {
++    let (width, height, row, ..) = shape.of();
++    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width, height, false);
++    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    if shape == Shape::PassesViews {
++        d.usage |= TextureUsage::PIXEL_FORMAT_VIEW;
++    }
++    d.resource_options = buffer.resource_options();
++    buffer
++        .new_texture_with_iosurface_plane(&d, IoSurfacePlane::new(0, row, false))
++        .unwrap()
++}
++
++fn form_of(texture: &Texture) -> &'static str {
++    // SAFETY: the handle is only compared, while the texture lives.
++    match unsafe { texture.vk_image() }.is_some() {
++        true => "in place",
++        false => "shadowed",
++    }
++}
++
++fn pass(
++    command_buffer: &CommandBuffer,
++    texture: &Texture,
++    blend: &RenderPipelineState,
++    rects: &[Buffer],
++    color: &Buffer,
++) {
++    let mut descriptor = RenderPassDescriptor::new();
++    let attachment = &mut descriptor.color_attachments[0];
++    attachment.texture = Some(texture.clone());
++    attachment.load_action = LoadAction::Load;
++    attachment.store_action = StoreAction::Store;
++    let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
++    encoder.set_render_pipeline_state(blend).unwrap();
++    encoder.set_fragment_buffer(Some(color), 0, 0).unwrap();
++    for rect in rects {
++        encoder.set_vertex_buffer(Some(rect), 0, 0).unwrap();
++        encoder
++            .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++            .unwrap();
++    }
++    encoder.end_encoding().unwrap();
++}
++
++fn per_frame(before: &WorkCounts, after: &WorkCounts) -> String {
++    let per = |f: fn(&WorkCounts) -> u64| (f(after) - f(before)) as f64 / FRAMES as f64;
++    format!(
++        "shadow copies {:.1}, texels in {:.0}, back {:.0}, copies in dispatched {:.1}, copies \
++         back dispatched {:.1}, merge copies dispatched {:.1}, command buffers {:.1}",
++        per(|c| c.shadow_copies),
++        per(|c| c.shadow_texels_copied_in),
++        per(|c| c.shadow_texels_copied_back),
++        per(|c| c.shadow_copies_in_dispatched),
++        per(|c| c.shadow_copies_back_dispatched),
++        per(|c| c.shadow_merge_copies_dispatched),
++        per(|c| c.command_buffers_submitted),
++    )
++}
++
++/// A hash of the bytes, FNV-1a.
++fn hash(bytes: &[u8]) -> u64 {
++    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
++        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
++    })
++}
++
++/// The desktop's frames under each setting (the module docs).
++#[test]
++#[ignore = "a release-mode measurement: run by name"]
++fn host_rt_frame_costs() {
++    let len = ((13824 * 1440) as usize).next_multiple_of(16384);
++    let mapping = Mapping::anonymous(len);
++    // SAFETY: the mapping's bytes, which no device uses between the cases.
++    let bytes = || unsafe { std::slice::from_raw_parts_mut(mapping.pointer().as_ptr(), len) };
++    let mut results: Vec<(Shape, Setting, u64, bool)> = Vec::new();
++    for round in 0..2 {
++        for shape in SHAPES {
++            let (width, height, row, passes, apart, small_rects) = shape.of();
++            for setting in SETTINGS {
++                // The parts are the desktop's; the sim's 4824-byte packed rows make no linear
++                // image on ANV.
++                let parts = matches!(setting, Setting::Private | Setting::LinearOwn);
++                if (shape == Shape::PassesViews && parts)
++                    || (shape == Shape::SimSmallApart && setting == Setting::LinearOwn)
++                {
++                    continue;
++                }
++                for (name, value) in setting.switches() {
++                    live::set(name, Some(value));
++                }
++                // Every byte a sentinel the passes overwrite in texels alone.
++                for (i, byte) in bytes().iter_mut().enumerate() {
++                    *byte = (i % 251) as u8;
++                }
++                let cache = ScratchCache::new().unwrap();
++                let messages = Messages::default();
++                let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |o| {
++                    o.layers.clear();
++                    o.policy.host_page_textures = HostPageTexturePolicy::InPlace;
++                })
++                .unwrap();
++                assert!(
++                    device.settle_in_place_checks(CHECK_WAIT),
++                    "the in-place check answered"
++                );
++                if round == 0 && shape == Shape::Passes && setting == Setting::Shadow {
++                    for line in device.in_place_check_report() {
++                        eprintln!("IN-PLACE-CHECK on {}: {line}", device.name());
++                    }
++                }
++                if setting == Setting::InPlace {
++                    assert!(
++                        device.settle_host_rt_checks(CHECK_WAIT),
++                        "the render-target check answered"
++                    );
++                    if round == 0 && shape == Shape::Passes {
++                        for line in device.host_rt_check_report() {
++                            eprintln!("HOST-RT-CHECK on {}: {line}", device.name());
++                        }
++                    }
++                }
++                let queue = device.new_command_queue().unwrap();
++                let blend = blending(&device, PixelFormat::BGRA8Unorm);
++                let full = [
++                    staged(&device, &floats([-1.0, -1.0, 1.0, 1.0])),
++                    staged(&device, &floats([-1.0, -1.0, 0.0, 0.0])),
++                    staged(&device, &floats([0.0, 0.0, 1.0, 1.0])),
++                ];
++                let small = [staged(&device, &floats([-0.25, -0.25, 0.25, 0.25]))];
++                let rects: &[Buffer] = match small_rects {
++                    true => &small,
++                    false => &full,
++                };
++                let color = staged(&device, &floats([0.25, 0.5, 0.75, 0.5]));
++                let (buffer, surface, form) = match setting {
++                    Setting::Private => {
++                        let mut d = TextureDescriptor::texture_2d(
++                            PixelFormat::BGRA8Unorm,
++                            width,
++                            height,
++                            false,
++                        );
++                        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++                        d.resource_options = ResourceOptions::private();
++                        let buffer = device.new_buffer(256, ResourceOptions::private()).unwrap();
++                        (buffer, device.new_texture(&d).unwrap(), "private")
++                    }
++                    Setting::LinearOwn => {
++                        let buffer = device
++                            .new_buffer(width * 4 * height, ResourceOptions::private())
++                            .unwrap();
++                        let mut d = TextureDescriptor::texture_2d(
++                            PixelFormat::BGRA8Unorm,
++                            width,
++                            height,
++                            false,
++                        );
++                        d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++                        d.resource_options = buffer.resource_options();
++                        let texture = buffer.new_texture(&d, 0, width * 4).unwrap();
++                        let form = match form_of(&texture) {
++                            "in place" => "linear over a private buffer",
++                            _ => "shadowed over a private buffer",
++                        };
++                        (buffer, texture, form)
++                    }
++                    _ => {
++                        let buffer = surface_buffer(&device, &mapping, len);
++                        let surface = plane_texture(&buffer, shape);
++                        let form = form_of(&surface);
++                        (buffer, surface, form)
++                    }
++                };
++                let (mut waits, mut gpus) = (Vec::new(), Vec::new());
++                let mut before = device.work_counts();
++                for k in 0..WARM + FRAMES {
++                    if k == WARM {
++                        before = device.work_counts();
++                    }
++                    let mut command_buffers = vec![queue.command_buffer().unwrap()];
++                    pass(&command_buffers[0], &surface, &blend, rects, &color);
++                    for _ in 1..passes {
++                        if apart {
++                            let command_buffer = queue.command_buffer().unwrap();
++                            pass(&command_buffer, &surface, &blend, rects, &color);
++                            command_buffers.push(command_buffer);
++                        } else {
++                            pass(&command_buffers[0], &surface, &blend, rects, &color);
++                        }
++                    }
++                    let committed = Instant::now();
++                    for command_buffer in &command_buffers {
++                        command_buffer.commit().unwrap();
++                    }
++                    let mut gpu = 0.0;
++                    for command_buffer in &command_buffers {
++                        command_buffer.wait_until_completed_for(WAIT).unwrap();
++                        assert_eq!(command_buffer.error(), None);
++                        gpu += command_buffer.gpu_end_time().unwrap()
++                            - command_buffer.gpu_start_time().unwrap();
++                    }
++                    if k >= WARM {
++                        waits.push(committed.elapsed().as_secs_f64() * 1e3);
++                        gpus.push(gpu * 1e3);
++                    }
++                }
++                let after = device.work_counts();
++                drop((surface, buffer));
++                let (gpu, gpu90) = median_p90(gpus);
++                let (wait, wait90) = median_p90(waits);
++                // The texels, and the bytes between the rows: the sentinel.
++                let surface_bytes = &bytes()[..(row * height) as usize];
++                let digest = hash(surface_bytes);
++                let between_kept = surface_bytes
++                    .iter()
++                    .enumerate()
++                    .all(|(i, &b)| (i as u64 % row) < width * 4 || b == (i % 251) as u8);
++                println!(
++                    "HOST-RT-FRAME on {}: round {round}, {shape:?}, {setting:?}: the texture \
++                     {form}; GPU {gpu:.2} ms (p90 {gpu90:.2}), commit to completion {wait:.2} ms \
++                     (p90 {wait90:.2}); bytes {digest:016x}, between the rows kept {between_kept}; \
++                     per frame: {}",
++                    device.name(),
++                    per_frame(&before, &after),
++                );
++                results.push((shape, setting, digest, between_kept));
++            }
++        }
++    }
++    for (name, _) in Setting::Shadow.switches() {
++        live::set(name, None);
++    }
++    for &(shape, setting, digest, between_kept) in &results {
++        if matches!(setting, Setting::Private | Setting::LinearOwn) {
++            continue;
++        }
++        let shadow = results
++            .iter()
++            .find(|r| r.0 == shape && r.1 == Setting::Shadow)
++            .map(|r| r.2);
++        assert!(
++            between_kept,
++            "{shape:?} {setting:?}: a byte between the rows changed"
++        );
++        assert_eq!(
++            Some(digest),
++            shadow,
++            "{shape:?} {setting:?}: other bytes than the shadow's"
++        );
++    }
++}
++
++/// macbox probe: a pass that clears to (0.1, 0.2, 0.3, 0.4) (and blends over the left
++/// half, or draws nothing) into a texture in place over host pages, a `Private` texture and a
++/// linear image over a `Private` buffer: the bytes of texel 0 and of a texel in the right half of
++/// each (`RT-PROBE`). On ANV 26.2.4 both linear images' clears write red 0x19 where the
++/// `Private` texture's writes 0x1a; the blends over them agree.
++#[test]
++#[ignore = "a probe: run by name"]
++fn host_rt_clear_probe() {
++    use metal2vulkan_runtime::ClearColor;
++    let (w, h) = (1920u64, 1080u64);
++    let row = w * 4;
++    let len = ((row * h) as usize).next_multiple_of(16384);
++    let mapping = Mapping::anonymous(len);
++    live::set("host_rt_in_place", Some("1"));
++    let cache = ScratchCache::new().unwrap();
++    let messages = Messages::default();
++    let device = validated_device_with(TEST_DEVICE, &messages, cache.path(), |o| {
++        o.policy.host_page_textures = HostPageTexturePolicy::InPlace;
++    })
++    .unwrap();
++    assert!(device.settle_in_place_checks(CHECK_WAIT));
++    assert!(device.settle_host_rt_checks(CHECK_WAIT));
++    let queue = device.new_command_queue().unwrap();
++    let blend = blending(&device, PixelFormat::BGRA8Unorm);
++    let left = staged(&device, &floats([-1.0, -1.0, 0.0, 1.0]));
++    let color = staged(&device, &floats([0.2, 0.4, 0.6, 0.5]));
++    let mut d = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, w, h, false);
++    d.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    let host = surface_buffer(&device, &mapping, len);
++    d.resource_options = host.resource_options();
++    let in_place = host.new_texture(&d, 0, row).unwrap();
++    d.resource_options = ResourceOptions::private();
++    let private = device.new_texture(&d).unwrap();
++    let own = device
++        .new_buffer(row * h, ResourceOptions::private())
++        .unwrap();
++    d.resource_options = own.resource_options();
++    let linear = own.new_texture(&d, 0, row).unwrap();
++    for draws in [false, true] {
++        for (name, texture) in [
++            ("in place", &in_place),
++            ("private", &private),
++            ("linear", &linear),
++        ] {
++            let out = device
++                .new_buffer(row * h, ResourceOptions::shared())
++                .unwrap();
++            let command_buffer = queue.command_buffer().unwrap();
++            let mut pass = RenderPassDescriptor::new();
++            let attachment = &mut pass.color_attachments[0];
++            attachment.texture = Some(texture.clone());
++            attachment.load_action = LoadAction::Clear;
++            attachment.store_action = StoreAction::Store;
++            attachment.clear_color = ClearColor::new(0.1, 0.2, 0.3, 0.4);
++            let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
++            if draws {
++                encoder.set_render_pipeline_state(&blend).unwrap();
++                encoder.set_vertex_buffer(Some(&left), 0, 0).unwrap();
++                encoder.set_fragment_buffer(Some(&color), 0, 0).unwrap();
++                encoder
++                    .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++                    .unwrap();
++            }
++            encoder.end_encoding().unwrap();
++            let mut blit = command_buffer.blit_command_encoder().unwrap();
++            blit.copy_from_texture_to_buffer(
++                texture,
++                0,
++                0,
++                metal2vulkan_runtime::Origin::new(0, 0, 0),
++                metal2vulkan_runtime::Size::new(w, h, 1),
++                &out,
++                0,
++                row,
++                row * h,
++                metal2vulkan_runtime::BlitOption::None,
++            )
++            .unwrap();
++            blit.end_encoding().unwrap();
++            command_buffer.commit().unwrap();
++            command_buffer.wait_until_completed_for(WAIT).unwrap();
++            assert_eq!(command_buffer.error(), None);
++            // SAFETY: a shared buffer, its command buffer completed.
++            let bytes = unsafe {
++                std::slice::from_raw_parts(out.contents().unwrap().as_ptr(), (row * h) as usize)
++            };
++            let at = |x: u64, y: u64| {
++                let o = (y * row + x * 4) as usize;
++                bytes[o..o + 4].to_vec()
++            };
++            eprintln!(
++                "RT-PROBE draws {draws}, {name}: texel 0 {:02x?}, texel (1500, 500) {:02x?}",
++                at(0, 0),
++                at(1500, 500)
++            );
++        }
++    }
++    live::set("host_rt_in_place", None);
++}
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/no_copy_textures.rs b/crates/metal2vulkan-validation/src/runtime_lane/no_copy_textures.rs
+index 73808f3a..9e1acfba 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/no_copy_textures.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/no_copy_textures.rs
+@@ -360,8 +360,11 @@ fn read_and_write_the_caller_s_pages_under(
+             let in_place = counted.host_textures_in_place - before.host_textures_in_place;
+             // Under `Shadow`, and for a texture that renders or writes, a shadow; under `InPlace`
+             // one that only reads may be in place, counted so.
+-            let may_alias =
+-                policy == HostPageTexturePolicy::InPlace && usage == TextureUsage::SHADER_READ;
++            // macbox: under `host_rt_in_place` one that renders or writes may be in
++            // place too.
++            let rt = metal2vulkan_runtime::live::on("host_rt_in_place", false);
++            let may_alias = policy == HostPageTexturePolicy::InPlace
++                && (usage == TextureUsage::SHADER_READ || rt);
+             assert!(
+                 !made || may_alias,
+                 "{what}: a texture over host pages aliased"
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+index 05fb0e6a..cf7ba041 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/pitched_surfaces.rs
+@@ -529,7 +529,10 @@ fn in_place_form(
+     let shadowed = counts.shadowed_textures - before.shadowed_textures;
+     let in_place = counts.host_textures_in_place - before.host_textures_in_place;
+     let policy = device.compile_device().policy().host_page_textures;
+-    let may_alias = policy == HostPageTexturePolicy::InPlace && usage == TextureUsage::SHADER_READ;
++    // macbox: under `host_rt_in_place` one that renders or writes may be in place too.
++    let rt = metal2vulkan_runtime::live::on("host_rt_in_place", false);
++    let may_alias =
++        policy == HostPageTexturePolicy::InPlace && (usage == TextureUsage::SHADER_READ || rt);
+     // SAFETY: the handle is only compared, while the texture lives.
+     let aliased = unsafe { texture.vk_image() }.is_some();
+     assert!(
+diff --git a/crates/metal2vulkan/tests/api_signatures.tsv b/crates/metal2vulkan/tests/api_signatures.tsv
+index fc35f3e7..cf1ba02c 100644
+--- a/crates/metal2vulkan/tests/api_signatures.tsv
++++ b/crates/metal2vulkan/tests/api_signatures.tsv
+@@ -4523,6 +4523,9 @@ fn	metal2vulkan-air::specialize	pub fn specialize(d: Decoded, r: &SpecRequest, m
+ fn	metal2vulkan-air::specialize_dynamic	pub fn specialize_dynamic(d: Decoded, r: &SpecRequest, (linked, dynamic): (&[LinkedModule], &DynamicLinks), m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-air::specialize_linked	pub fn specialize_linked(d: Decoded, r: &SpecRequest, linked: &[LinkedModule], m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-runtime::host_time	pub fn host_time() -> f64
++fn	metal2vulkan-runtime::live::fact	pub fn fact(facts: &std::collections::BTreeSet<DriverFact>, fact: DriverFact) -> bool
++fn	metal2vulkan-runtime::live::get	pub fn get(name: &str) -> Option<String>
++fn	metal2vulkan-runtime::live::on	pub fn on(name: &str, default: bool) -> bool
+ fn	metal2vulkan-runtime::process_exiting	pub fn process_exiting() -> bool
+ fn	metal2vulkan-runtime::sampler_border_color	pub fn sampler_border_color(raw: u64) -> SamplerBorderColor
+ fn	metal2vulkan::ash_interop::sampler_create_info	pub fn sampler_create_info<'a>(desc: &vk::SamplerDesc, reduction: &'a mut ash::vk::SamplerReductionModeCreateInfo<'static>, border: &'a mut ash::vk::SamplerBorderColorComponentMappingCreateInfoEXT<'static>) -> ash::vk::SamplerCreateInfo<'a>
+@@ -7644,6 +7647,7 @@ method	metal2vulkan-runtime::Device::from_raw	pub unsafe fn from_raw(raw: RawDev
+ method	metal2vulkan-runtime::Device::heap_buffer_size_and_align	pub fn heap_buffer_size_and_align(&self, length: u64, _options: ResourceOptions) -> SizeAndAlign
+ method	metal2vulkan-runtime::Device::heap_texture_size_and_align	pub fn heap_texture_size_and_align(&self, descriptor: &TextureDescriptor) -> Result<SizeAndAlign, Error>
+ method	metal2vulkan-runtime::Device::host_range_remapped	pub fn host_range_remapped(&self, bytes: NonNull<u8>, length: u64)
++method	metal2vulkan-runtime::Device::host_rt_check_report	pub fn host_rt_check_report(&self) -> Vec<String>
+ method	metal2vulkan-runtime::Device::imports_shared_host_pointers	pub fn imports_shared_host_pointers(&self) -> Result<bool, Error>
+ method	metal2vulkan-runtime::Device::in_place_check_report	pub fn in_place_check_report(&self) -> Vec<String>
+ method	metal2vulkan-runtime::Device::in_place_check_took	pub fn in_place_check_took(&self) -> Option<Duration>
+@@ -7705,6 +7709,7 @@ method	metal2vulkan-runtime::Device::reserve_address_pool	pub fn reserve_address
+ method	metal2vulkan-runtime::Device::reserve_resource_ids	pub fn reserve_resource_ids(&self, kind: ResourceIdKind, ids: &[ResourceId]) -> Result<(), Error>
+ method	metal2vulkan-runtime::Device::sampler_id_pool_size	pub fn sampler_id_pool_size(&self) -> u64
+ method	metal2vulkan-runtime::Device::sampler_ids_live	pub fn sampler_ids_live(&self) -> u64
++method	metal2vulkan-runtime::Device::settle_host_rt_checks	pub fn settle_host_rt_checks(&self, timeout: Duration) -> bool
+ method	metal2vulkan-runtime::Device::settle_in_place_checks	pub fn settle_in_place_checks(&self, timeout: Duration) -> bool
+ method	metal2vulkan-runtime::Device::shader_cache_directory	pub fn shader_cache_directory(&self) -> &Path
+ method	metal2vulkan-runtime::Device::shader_cache_statistics	pub fn shader_cache_statistics(&self) -> ShaderCacheStatistics

@@ -1,0 +1,848 @@
+#!/bin/bash
+# macbox-guest: sets up and checks macOS inside a macbox VM. It runs as the guest's user, usually
+# over SSH from the host (`macbox provision` copies guest/ to ~/.macbox/ and runs this). Every
+# subcommand can be run again: it says what it did ("done"), what was already so ("ok"), and what
+# is left ("todo"). It lives at ~/.macbox/macbox-guest (linked from ~/.macbox/bin), beside bin/ and share/.
+#
+#   macbox-guest base [--reduce-transparency] [--autologin]
+#                                    sudo without a password, Metal's error mode, no sleep, no
+#                                    screen saver, no Spotlight, no automatic update downloads,
+#                                    PATH in ~/.zshenv. --autologin reads the user's password on stdin.
+#   macbox-guest tools               Node, Ruby + CocoaPods, Go + simslim, setmode (pinned in share/versions.env)
+#   macbox-guest xcode <Xcode.xip>   install Xcode from Apple's .xip (copy it into ~/.macbox/downloads/)
+#   macbox-guest xcode status
+#   macbox-guest runtime [<.dmg>]    the iOS Simulator runtime (downloads it from Apple without a .dmg)
+#   macbox-guest pool create [--delete-defaults]|list|delete --yes [--types]
+#                                    the simulator pool (MACBOX_POOL, names "<device> (<prefix> <label>)")
+#   macbox-guest t3-hub [version]    rebuild T3 Code's expo-device-hub native parts for Intel
+#   macbox-guest stream-settings install|remove|status
+#                                    keep the Device panel's simulator stream light (a LaunchAgent)
+#   macbox-guest doctor              what is set up and what is missing, one line each
+#
+# Settings: the environment, then ~/.macbox/config.env (KEY=value lines the host may write), then
+# share/versions.env. macOS's own bash is 3.2, so this script avoids newer bash features.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"      # ~/.macbox, or guest/ in a checkout of the repo
+SHARE="$ROOT/share"
+MB="$HOME/.macbox"                         # where builds, downloads and state go
+SRC="$MB/src"
+DL="$MB/downloads"
+TYPES_DIR="$HOME/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
+export PATH="$MB/bin:$HOME/.local/bin:$HOME/go/bin:/usr/local/go/bin:/usr/local/bin:$PATH"
+
+load_env() {  # load_env <file>: KEY=value lines; a variable already set wins
+  local f="$1" line k v
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}" v="${line#*=}"
+    case "$k" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    eval "[ -n \"\${$k+x}\" ]" && continue
+    case "$v" in \"*\") v="${v#\"}" v="${v%\"}" ;; \'*\') v="${v#\'}" v="${v%\'}" ;; esac
+    export "$k=$v"
+  done < "$f"
+}
+load_env "$MB/config.env"
+load_env "$SHARE/versions.env"
+MACBOX_SIM_PREFIX="${MACBOX_SIM_PREFIX:-macbox}"
+MACBOX_POOL="${MACBOX_POOL:-full slim-1 slim-2 sharp small}"
+
+say()  { printf '%s\n' "$*"; }
+did()  { printf '  done  %s\n' "$*"; }
+ok()   { printf '  ok    %s\n' "$*"; }
+todo() { printf '  todo  %s\n' "$*"; }
+die()  { printf 'macbox-guest: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+PB=/usr/libexec/PlistBuddy
+
+# sudo: passwordless once `base` has run. Before that, ask on the terminal (ssh -t) or take the
+# password `base --autologin` read from stdin.
+PASSWORD=""
+sudo_ready() {
+  sudo -n true 2>/dev/null && return 0
+  if [ -n "$PASSWORD" ]; then
+    printf '%s\n' "$PASSWORD" | sudo -S -p '' -v 2>/dev/null && return 0
+    die "sudo refused the password given on stdin"
+  fi
+  [ -t 0 ] || die "sudo needs the password once: run this with a terminal (ssh -t), or after \`macbox-guest base\` has set up sudo"
+  sudo -v
+}
+
+fetch() {  # fetch <url> <file> <sha256>: download (kept for reruns) and check
+  local url="$1" out="$2" sum="$3" got
+  mkdir -p "$(dirname "$out")"
+  if [ -f "$out" ] && [ "$(shasum -a 256 "$out" | cut -d' ' -f1)" = "$sum" ]; then return 0; fi
+  curl -fL --retry 3 --progress-bar -o "$out.part" "$url"
+  got="$(shasum -a 256 "$out.part" | cut -d' ' -f1)"
+  if [ "$got" != "$sum" ]; then
+    rm -f "$out.part"
+    die "checksum mismatch for $url (got $got, want $sum)"
+  fi
+  mv "$out.part" "$out"
+}
+
+# ---------------------------------------------------------------- base
+base_sudo() {
+  if sudo -n -l 2>/dev/null | grep -q 'NOPASSWD: ALL'; then ok "sudo without a password"; return; fi
+  sudo_ready
+  local f="/etc/sudoers.d/macbox-$USER" t
+  t="$(mktemp)"
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$USER" > "$t"
+  sudo visudo -cqf "$t" || { rm -f "$t"; die "visudo rejected the sudoers line"; }
+  sudo install -m 440 -o root -g wheel "$t" "$f"
+  rm -f "$t"
+  did "sudo without a password ($f)"
+}
+
+base_metal() {
+  # Without METAL_ERROR_MODE=5, macOS's icon service crashes on Reims vGPU and the desktop never
+  # finishes coming up (see Reims vGPU's README). A desktop that works already has it.
+  local v; v="$(defaults read /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE 2>/dev/null || true)"
+  if [ "$v" = 5 ]; then ok "METAL_ERROR_MODE 5"; return; fi
+  sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
+  sudo chmod 644 /Library/Preferences/.GlobalPreferences.plist
+  did "METAL_ERROR_MODE 5 (restart macOS for it to apply)"
+}
+
+base_power() {
+  local k want cur changed=""
+  for kv in sleep=0 displaysleep=0 disksleep=0 standby=0 powernap=0 autorestart=1; do
+    k="${kv%=*}" want="${kv#*=}"
+    cur="$(pmset -g | awk -v k="$k" '$1 == k {print $2; exit}')"
+    [ "$cur" = "$want" ] && continue
+    sudo pmset -a "$k" "$want" 2>/dev/null || continue
+    # A setting this Mac doesn't have (a VM has no standby, say) stays unlisted: not a change.
+    if [ -n "$(pmset -g | awk -v k="$k" '$1 == k {print $2; exit}')" ]; then changed="$changed $k=$want"; fi
+  done
+  if [ -n "$changed" ]; then did "power:$changed"; else ok "no sleep, no display sleep"; fi
+}
+
+base_screensaver() {
+  if [ "$(defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null || true)" = 0 ]; then
+    ok "screen saver off"
+  else
+    defaults -currentHost write com.apple.screensaver idleTime -int 0
+    did "screen saver off"
+  fi
+  if sysadminctl -screenLock status 2>&1 | grep -q 'screenLock is off'; then
+    ok "screen lock off"
+  elif [ -t 0 ] && [ -z "$PASSWORD" ]; then
+    say "  sysadminctl asks for $USER's password to turn the screen lock off:"
+    sysadminctl -screenLock off -password - && did "screen lock off"
+  else
+    todo "screen lock: run \`sysadminctl -screenLock off -password -\` in a terminal (or System Settings > Lock Screen)"
+  fi
+}
+
+base_spotlight() {
+  if mdutil -s / 2>/dev/null | grep -qi 'disabled'; then ok "Spotlight indexing off"; return; fi
+  sudo mdutil -a -i off >/dev/null
+  did "Spotlight indexing off"
+}
+
+base_updates() {
+  local p=/Library/Preferences/com.apple.SoftwareUpdate changed=""
+  for k in AutomaticDownload AutomaticallyInstallMacOSUpdates; do
+    [ "$(defaults read "$p" "$k" 2>/dev/null || true)" = 0 ] && continue
+    sudo defaults write "$p" "$k" -bool false
+    changed="$changed $k"
+  done
+  if [ "$(defaults read /Library/Preferences/com.apple.commerce AutoUpdate 2>/dev/null || true)" != 0 ]; then
+    sudo defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
+    changed="$changed AppStoreAutoUpdate"
+  fi
+  if [ -n "$changed" ]; then did "automatic update downloads off:$changed"; else ok "automatic update downloads off"; fi
+}
+
+base_transparency() {
+  if [ "$(defaults read com.apple.universalaccess reduceTransparency 2>/dev/null || true)" = 1 ]; then
+    ok "Reduce Transparency on"
+  elif defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null; then
+    did "Reduce Transparency on (log out and in, or restart, to see it)"
+  else
+    todo "Reduce Transparency: System Settings > Accessibility > Display (macOS refused the write over SSH)"
+  fi
+}
+
+ruby_abi() { echo "${RUBY_VERSION%.*}.0"; }   # 3.4.5 -> 3.4.0, the gem directory's name
+
+base_zshenv() {
+  local f="$HOME/.zshenv" begin="# >>> macbox >>>" end="# <<< macbox <<<" block new
+  block="$begin
+# Managed by macbox-guest (base); edits between these lines are replaced.
+export PATH=\"\$HOME/.macbox/bin:\$HOME/.local/bin:\$HOME/.local/portable-ruby/current/bin:\$HOME/.local/share/gem/ruby/$(ruby_abi)/bin:\$HOME/go/bin:/usr/local/go/bin:/usr/local/bin:\$PATH\"
+# CocoaPods needs a UTF-8 locale, which SSH sessions don't always set.
+export LANG=\"\${LANG:-en_US.UTF-8}\"
+$end"
+  touch "$f"
+  new="$(awk -v b="$begin" -v e="$end" '$0 == b {skip = 1} !skip {print} $0 == e {skip = 0}' "$f")"
+  new="${new:+$new
+}$block"
+  if [ "$(cat "$f")" = "$new" ]; then ok "PATH block in ~/.zshenv"; return; fi
+  printf '%s\n' "$new" > "$f.macbox-tmp" && mv "$f.macbox-tmp" "$f"
+  did "PATH block in ~/.zshenv"
+}
+
+base_autologin() {
+  if fdesetup status 2>/dev/null | grep -q 'On'; then
+    todo "automatic login: FileVault is on, which rules it out"
+    return
+  fi
+  # /etc/kcpassword: the password XOR Apple's 11-byte key, padded with NULs to a multiple of 12
+  # bytes. The password stays on stdin; it never appears in a command line.
+  local t; t="$(mktemp)"
+  printf '%s' "$PASSWORD" | perl -e '
+    my @k = (0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB9,0x1F);
+    local $/; my $p = <STDIN>; $p .= "\0" x (12 - length($p) % 12);
+    print join "", map { chr(ord(substr($p, $_, 1)) ^ $k[$_ % 11]) } 0 .. length($p) - 1;' > "$t"
+  if sudo cmp -s "$t" /etc/kcpassword 2>/dev/null &&
+     [ "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true)" = "$USER" ]; then
+    ok "automatic login as $USER"
+  else
+    sudo install -m 600 -o root -g wheel "$t" /etc/kcpassword
+    sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$USER"
+    did "automatic login as $USER (from the next restart)"
+  fi
+  rm -f "$t"
+}
+
+cmd_base() {
+  local reduce=0 autologin=0 a
+  for a in "$@"; do
+    case "$a" in
+      --reduce-transparency) reduce=1 ;;
+      --autologin) autologin=1 ;;
+      *) die "base: unknown option $a" ;;
+    esac
+  done
+  if [ "$autologin" = 1 ]; then
+    IFS= read -r PASSWORD || true
+    [ -n "$PASSWORD" ] || die "base --autologin: give $USER's password on stdin"
+  fi
+  say "== base ($USER on macOS $(sw_vers -productVersion))"
+  base_sudo
+  base_metal
+  base_power
+  base_screensaver
+  base_spotlight
+  base_updates
+  [ "$reduce" = 1 ] && base_transparency
+  base_zshenv
+  if [ "$autologin" = 1 ]; then
+    base_autologin
+  elif [ "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true)" = "$USER" ]; then
+    ok "automatic login as $USER"
+  else
+    todo "automatic login: \`printf '%s\\n' <password> | macbox-guest base --autologin\`, or System Settings > Users & Groups"
+  fi
+  mkdir -p "$MB/bin" "$SRC" "$DL"
+  if [ "$ROOT" = "$MB" ] && [ ! -e "$MB/bin/macbox-guest" ]; then
+    ln -s ../macbox-guest "$MB/bin/macbox-guest"
+    did "macbox-guest on PATH (~/.macbox/bin)"
+  fi
+}
+
+# ---------------------------------------------------------------- tools
+tools_node() {
+  local v; v="$(/usr/local/bin/node -v 2>/dev/null || true)"
+  if [ "$v" = "v$NODE_VERSION" ]; then ok "Node $v"; return; fi
+  if [ -n "$v" ] && [ "${NODE_FORCE:-}" != 1 ]; then ok "Node $v (pinned is v$NODE_VERSION; NODE_FORCE=1 installs it)"; return; fi
+  local f="$DL/node-v$NODE_VERSION.pkg"
+  fetch "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION.pkg" "$f" "$NODE_PKG_SHA256"
+  sudo_ready
+  sudo installer -pkg "$f" -target / >/dev/null
+  did "Node $(/usr/local/bin/node -v)"
+}
+
+tools_ruby() {
+  local base="$HOME/.local/portable-ruby" ruby gem
+  ruby="$base/current/bin/ruby" gem="$base/current/bin/gem"
+  if "$ruby" -v 2>/dev/null | grep -q "^ruby $RUBY_VERSION"; then
+    ok "Ruby $RUBY_VERSION (portable)"
+  else
+    local f="$DL/portable-ruby-$RUBY_VERSION.tar.gz"
+    fetch "$RUBY_URL" "$f" "$RUBY_SHA256"
+    mkdir -p "$HOME/.local"
+    tar -xzf "$f" -C "$HOME/.local"     # unpacks portable-ruby/<version>/
+    ln -sfn "$RUBY_VERSION" "$base/current"
+    did "Ruby $RUBY_VERSION in ~/.local/portable-ruby"
+  fi
+  # CocoaPods' `pod` runs the first ruby on PATH: the ~/.zshenv block puts this one before /usr/bin.
+  if "$gem" list -i cocoapods -v "$COCOAPODS_VERSION" >/dev/null 2>&1; then
+    ok "CocoaPods $COCOAPODS_VERSION"
+  else
+    LANG="${LANG:-en_US.UTF-8}" "$gem" install --user-install --no-document cocoapods -v "$COCOAPODS_VERSION" >/dev/null
+    did "CocoaPods $COCOAPODS_VERSION"
+  fi
+}
+
+tools_go() {
+  if /usr/local/go/bin/go version 2>/dev/null | grep -q "go$GO_VERSION "; then ok "Go $GO_VERSION"; return; fi
+  local f="$DL/go$GO_VERSION.darwin-amd64.pkg"
+  fetch "https://go.dev/dl/go$GO_VERSION.darwin-amd64.pkg" "$f" "$GO_PKG_SHA256"
+  sudo_ready
+  sudo installer -pkg "$f" -target / >/dev/null
+  did "Go $GO_VERSION"
+}
+
+tools_simslim() {
+  local b="$HOME/go/bin/simslim"
+  if [ -x "$b" ] && /usr/local/go/bin/go version -m "$b" 2>/dev/null | grep -q "mod.*github.com/mobai-app/simslim.*$SIMSLIM_VERSION"; then
+    ok "simslim $SIMSLIM_VERSION"; return
+  fi
+  GOTOOLCHAIN=local /usr/local/go/bin/go install "github.com/mobai-app/simslim/cmd/simslim@$SIMSLIM_VERSION"
+  did "simslim $SIMSLIM_VERSION (~/go/bin)"
+}
+
+tools_setmode() {
+  local out="$MB/bin/setmode"
+  if [ -x "$out" ] && [ "$out" -nt "$SHARE/setmode.swift" ]; then ok "setmode"; return; fi
+  if ! xcrun --find swiftc >/dev/null 2>&1; then
+    todo "setmode needs Xcode's Swift compiler: run \`macbox-guest tools\` again after \`macbox-guest xcode\`"
+    return
+  fi
+  mkdir -p "$MB/bin"
+  xcrun swiftc -O "$SHARE/setmode.swift" -o "$out"
+  did "setmode (list or set the display's mode)"
+}
+
+cmd_tools() {
+  say "== tools"
+  mkdir -p "$DL" "$MB/bin"
+  tools_node
+  tools_ruby
+  tools_go
+  tools_simslim
+  tools_setmode
+}
+
+# ---------------------------------------------------------------- xcode
+app_version() { $PB -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null || true; }
+
+xcode_status() {
+  local dev v
+  dev="$(xcode-select -p 2>/dev/null || true)"
+  case "$dev" in
+    */Xcode*.app/Contents/Developer) ;;
+    *) todo "Xcode: not installed or not selected (xcode-select -p: ${dev:-none})"; return 1 ;;
+  esac
+  v="$(xcodebuild -version 2>/dev/null | awk 'NR == 1 {v = $2} /Build version/ {b = $3} END {print v " (" b ")"}')"
+  ok "Xcode $v at ${dev%/Contents/Developer}"
+  if xcodebuild -license check >/dev/null 2>&1; then ok "Xcode licence accepted"; else todo "Xcode licence: sudo xcodebuild -license accept"; fi
+  if xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then ok "Xcode first launch done"; else todo "Xcode first launch: sudo xcodebuild -runFirstLaunch"; fi
+}
+
+cmd_xcode() {
+  local xip="${1:-}"
+  case "$xip" in
+    status) xcode_status || true; return ;;
+    "") say "usage: macbox-guest xcode <Xcode_NN.N.xip> | status"
+        say "  Download Xcode from https://developer.apple.com/download/all/?q=Xcode (a free Apple Account"
+        say "  is enough), copy it here (scp Xcode_26.6.xip <host>:.macbox/downloads/), then run this again."
+        say "  ~/.macbox/downloads isn't one of macOS's protected folders, so SSH can read it; ~/Downloads is."
+        return 2 ;;
+  esac
+  [ -f "$xip" ] || die "no file $xip"
+  if ! head -c 1 "$xip" >/dev/null 2>&1; then
+    die "can't read $xip: over SSH macOS keeps ~/Downloads, ~/Desktop and ~/Documents private unless \"Allow full disk access for remote users\" is on (System Settings > General > Sharing > Remote Login). Put the .xip in ~/.macbox/downloads/ instead"
+  fi
+  say "== xcode"
+  local want="" cur
+  case "$(basename "$xip")" in Xcode_*.xip) want="$(basename "$xip" .xip)"; want="${want#Xcode_}" ;; esac
+  cur="$(app_version /Applications/Xcode.app)"
+  if [ -n "$want" ] && [ "$cur" = "$want" ]; then
+    ok "Xcode $cur already in /Applications/Xcode.app"
+  else
+    # Apple signs every .xip; refuse anything else.
+    if ! pkgutil --check-signature "$xip" 2>/dev/null | grep -q 'signed Apple Software'; then
+      [ "${XIP_UNSIGNED_OK:-}" = 1 ] || die "$xip is not signed by Apple (pkgutil --check-signature); XIP_UNSIGNED_OK=1 to go on anyway"
+    fi
+    local need free work="$MB/xcode-expand"
+    need=$(( $(du -k "$xip" | cut -f1) * 4 / 1024 / 1024 + 5 ))
+    free=$(( $(df -k "$HOME" | awk 'NR == 2 {print $4}') / 1024 / 1024 ))
+    [ "$free" -ge "$need" ] || die "about ${need} GB free needed to expand $xip, ${free} GB free"
+    rm -rf "$work"; mkdir -p "$work"
+    say "  expanding $(basename "$xip") (15 to 45 minutes; xip prints nothing meanwhile)"
+    (cd "$work" && xip --expand "$xip")
+    local app; app="$(ls -d "$work"/Xcode*.app | head -1)"
+    [ -d "$app" ] || die "xip gave no Xcode app"
+    local v; v="$(app_version "$app")"
+    sudo_ready
+    if [ -d /Applications/Xcode.app ]; then
+      sudo mv /Applications/Xcode.app "/Applications/Xcode-$(app_version /Applications/Xcode.app).app"
+      did "kept the previous Xcode as /Applications/Xcode-$cur.app"
+    fi
+    sudo mv "$app" /Applications/Xcode.app
+    rm -rf "$work"
+    did "Xcode $v in /Applications/Xcode.app (the .xip can go: rm $xip)"
+  fi
+  sudo_ready
+  if [ "$(xcode-select -p 2>/dev/null)" != /Applications/Xcode.app/Contents/Developer ]; then
+    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    did "xcode-select /Applications/Xcode.app"
+  fi
+  xcodebuild -license check >/dev/null 2>&1 || { sudo xcodebuild -license accept; did "Xcode licence accepted"; }
+  xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1 || { sudo xcodebuild -runFirstLaunch; did "Xcode first launch (system packages)"; }
+  # Debugging (lldb, Instruments) without a password dialog on the Mac's screen.
+  DevToolsSecurity -status 2>/dev/null | grep -q enabled || { sudo DevToolsSecurity -enable >/dev/null; did "developer mode for debugging (DevToolsSecurity)"; }
+  tools_setmode
+  xcode_status || true
+}
+
+# ---------------------------------------------------------------- runtime
+ios_runtimes() { xcrun simctl list runtimes available 2>/dev/null | grep '^iOS ' || true; }
+
+cmd_runtime() {
+  local dmg="${1:-}"
+  say "== iOS Simulator runtime"
+  xcode_status >/dev/null || die "install Xcode first (macbox-guest xcode)"
+  if [ -n "$dmg" ]; then
+    [ -f "$dmg" ] || die "no file $dmg"
+    xcrun simctl runtime add "$dmg"
+    did "added $(basename "$dmg")"
+  elif [ -n "$(ios_runtimes)" ] && [ "${RUNTIME_FORCE:-}" != 1 ]; then
+    ok "already installed (RUNTIME_FORCE=1 downloads Xcode's own one again)"
+  else
+    # Download to a folder, then add it with simctl: `xcodebuild -downloadPlatform iOS` alone
+    # installs as it downloads, and once hung at 99% here after the download had finished.
+    # An Intel Mac needs the universal variant (the arm64 one has no x86_64 slices).
+    local out="$DL/runtimes"
+    mkdir -p "$out"
+    say "  downloading from Apple (about 8 GB; no Apple Account needed)"
+    xcodebuild -downloadPlatform iOS -exportPath "$out" -architectureVariant universal
+    dmg="$(ls -t "$out"/*.dmg 2>/dev/null | head -1)"
+    [ -n "$dmg" ] || die "xcodebuild left no .dmg in $out"
+    xcrun simctl runtime add "$dmg"
+    did "added $(basename "$dmg") (delete it to get the space back: rm \"$dmg\")"
+  fi
+  ios_runtimes | sed 's/^/        /'
+  say "  The first boot of a simulator on a new runtime builds its shared cache: a few slow minutes."
+}
+
+# ---------------------------------------------------------------- pool
+simq() {  # simq <query> [args]: answers from simctl's JSON (python3 comes with Xcode)
+  xcrun python3 - "$@" <<'PY'
+import json, re, subprocess, sys
+
+def simctl(*a):
+    return json.loads(subprocess.run(["xcrun", "simctl", "list", "-j", *a], check=True,
+                                     capture_output=True, text=True).stdout)
+
+def newest_ios():
+    rts = [r for r in simctl("runtimes")["runtimes"]
+           if r.get("isAvailable") and r.get("platform", r["name"].split()[0]) == "iOS"]
+    if not rts:
+        return None
+    key = lambda r: [int(x) for x in re.findall(r"\d+", r["version"])]
+    return max(rts, key=key)
+
+q, args = sys.argv[1], sys.argv[2:]
+if q == "runtime":            # identifier and version of the newest iOS runtime
+    r = newest_ios()
+    if r: print(r["identifier"], r["version"])
+elif q == "types":            # the pool's stock device types on that runtime: pro|small<TAB>name<TAB>id<TAB>bundle
+    r = newest_ios()
+    best = {}
+    for d in (r or {}).get("supportedDeviceTypes", []):
+        if not d["identifier"].startswith("com.apple."):
+            continue
+        for kind, pat in (("pro", r"^iPhone (\d+) Pro$"), ("small", r"^iPhone (\d+)e$"), ("plain", r"^iPhone (\d+)$")):
+            m = re.match(pat, d["name"])
+            if m and (kind not in best or int(m.group(1)) > best[kind][0]):
+                best[kind] = (int(m.group(1)), d)
+    if "small" not in best and "plain" in best:
+        best["small"] = best["plain"]
+    for kind in ("pro", "small"):
+        if kind in best:
+            d = best[kind][1]
+            print("\t".join([kind, d["name"], d["identifier"], d.get("bundlePath", "")]))
+elif q == "type-known":       # is this device type identifier known to CoreSimulator?
+    ids = {t["identifier"] for t in simctl("devicetypes")["devicetypes"]}
+    sys.exit(0 if args[0] in ids else 1)
+elif q == "device":           # udid<TAB>state<TAB>device type of the available device with this exact name
+    for rt, devs in simctl("devices")["devices"].items():
+        for d in devs:
+            if d["name"] == args[0] and d.get("isAvailable", True):
+                print("\t".join([d["udid"], d["state"], d.get("deviceTypeIdentifier", "")]))
+                sys.exit(0)
+elif q == "booted":           # names of booted devices
+    for devs in simctl("devices")["devices"].values():
+        for d in devs:
+            if d["state"] == "Booted":
+                print(d["name"])
+elif q == "defaults":         # shut-down devices named exactly like a stock device type: CoreSimulator's defaults
+    names = {t["name"] for t in simctl("devicetypes")["devicetypes"]}
+    for devs in simctl("devices")["devices"].values():
+        for d in devs:
+            if d["name"] in names and d["state"] == "Shutdown":
+                print("\t".join([d["udid"], d["name"]]))
+PY
+}
+
+kind_label() {  # kind -> the label in the simulator's name
+  case "$1" in
+    full|sharp|small) echo "$1" ;;
+    slim-[0-9]*) echo "slim ${1#slim-}" ;;
+    *) return 1 ;;
+  esac
+}
+kind_slim() { case "$1" in full) echo 0 ;; *) echo 1 ;; esac; }
+
+slim_count() {  # services simslim keeps disabled for a simulator (0 = stock or never slimmed)
+  local f="/private/var/tmp/com.apple.CoreSimulator.SimDevice.$1/disabled.plist"
+  [ -f "$f" ] || { echo 0; return; }
+  plutil -p "$f" 2>/dev/null | grep -c '=> true' || true
+}
+
+make_type() {  # make_type <stock bundle> <stock id> <scale>: a copy of a stock device type at another pixel scale
+  local bundle="$1" stock_id="$2" scale="$3" name dest id P s w h wd hd pw ph
+  name="$(basename "$bundle" .simdevicetype)"
+  dest="$TYPES_DIR/$name (${scale}x).simdevicetype"
+  id="dev.macbox.CoreSimulator.SimDeviceType.${stock_id##*.}-${scale}x"
+  if [ -d "$dest" ] && [ "$($PB -c 'Print :CFBundleIdentifier' "$dest/Contents/Info.plist" 2>/dev/null)" = "$id" ]; then
+    echo "$id"; return 0
+  fi
+  [ -d "$bundle" ] || die "no device type bundle at $bundle"
+  mkdir -p "$TYPES_DIR"
+  rm -rf "$dest.tmp"
+  ditto "$bundle" "$dest.tmp"
+  P="$dest.tmp/Contents/Resources/profile.plist"
+  s="$($PB -c 'Print :mainScreenScale' "$P" | awk '{printf "%d", $1}')"
+  w="$($PB -c 'Print :mainScreenWidth' "$P")" h="$($PB -c 'Print :mainScreenHeight' "$P")"
+  wd="$($PB -c 'Print :mainScreenWidthDPI' "$P")" hd="$($PB -c 'Print :mainScreenHeightDPI' "$P")"
+  pw=$(( w / s )) ph=$(( h / s ))       # the layout in points stays the same; only pixels change
+  $PB -c "Set :mainScreenScale $scale" -c "Set :mainScreenWidth $(( pw * scale ))" \
+      -c "Set :mainScreenHeight $(( ph * scale ))" \
+      -c "Set :mainScreenWidthDPI $(( (wd * scale + s / 2) / s ))" \
+      -c "Set :mainScreenHeightDPI $(( (hd * scale + s / 2) / s ))" "$P"
+  # Without these, CoreSimulator creates and pairs devices of this type on its own.
+  $PB -c 'Delete :createByDefaultForRuntimeVersions' "$P" 2>/dev/null || true
+  $PB -c 'Delete :pairByDefaultForRuntimeVersions' "$P" 2>/dev/null || true
+  $PB -c "Set :CFBundleIdentifier $id" -c "Set :CFBundleName $name (${scale}x)" "$dest.tmp/Contents/Info.plist"
+  mv "$dest.tmp" "$dest"
+  printf '  done  device type %s (%sx%s)\n' "$name (${scale}x)" "$(( pw * scale ))" "$(( ph * scale ))" >&2
+  echo "$id"
+}
+
+restart_coresim_if_idle() {
+  # CoreSimulatorService reads device types when it starts. Restarting it shuts down EVERY
+  # booted simulator, so only do it when none is booted (FORCE=1 overrides).
+  local booted; booted="$(simq booted)"
+  if [ -n "$booted" ] && [ "${FORCE:-}" != 1 ]; then
+    die "new device types need a CoreSimulatorService restart, which would shut down: $(echo "$booted" | tr '\n' ',' | sed 's/,$//'). Shut them down (or FORCE=1) and run this again"
+  fi
+  pkill -f CoreSimulatorService 2>/dev/null || true   # it starts again on the next simctl call
+  sleep 2
+  did "restarted CoreSimulatorService to load the new device types"
+}
+
+pool_resolve() {  # sets RUNTIME RT_VERSION PRO_NAME PRO_ID PRO_BUNDLE SMALL_NAME SMALL_ID
+  local line kind name id bundle
+  read -r RUNTIME RT_VERSION <<< "$(simq runtime)"
+  [ -n "${RUNTIME:-}" ] || die "no iOS Simulator runtime: macbox-guest runtime"
+  PRO_NAME="" PRO_ID="" PRO_BUNDLE="" SMALL_NAME="" SMALL_ID=""
+  while IFS="$(printf '\t')" read -r kind name id bundle; do
+    case "$kind" in
+      pro) PRO_NAME="$name" PRO_ID="$id" PRO_BUNDLE="$bundle" ;;
+      small) SMALL_NAME="$name" SMALL_ID="$id" ;;
+    esac
+  done <<< "$(simq types)"
+  [ -n "$PRO_ID" ] || die "the iOS $RT_VERSION runtime supports no \"iPhone NN Pro\""
+}
+
+pool_name() {  # pool_name <kind>: the simulator's name
+  local label; label="$(kind_label "$1")" || die "unknown pool kind $1 (full, slim-N, sharp, small)"
+  case "$1" in
+    small) [ -n "$SMALL_NAME" ] || die "no small iPhone on iOS $RT_VERSION"; echo "$SMALL_NAME ($MACBOX_SIM_PREFIX $label)" ;;
+    *) echo "$PRO_NAME ($MACBOX_SIM_PREFIX $label)" ;;
+  esac
+}
+
+cmd_pool() {
+  local sub="${1:-list}"; shift || true
+  xcode_status >/dev/null || die "install Xcode first (macbox-guest xcode)"
+  case "$sub" in
+    create) pool_create "$@" ;;
+    list) pool_list ;;
+    delete) pool_delete "$@" ;;
+    *) die "usage: macbox-guest pool create [--delete-defaults] | list | delete --yes [--types]" ;;
+  esac
+}
+
+pool_create() {
+  local del_defaults=0 a
+  for a in "$@"; do
+    case "$a" in --delete-defaults) del_defaults=1 ;; *) die "pool create: unknown option $a" ;; esac
+  done
+  pool_resolve
+  say "== pool on iOS $RT_VERSION ($PRO_NAME; prefix \"$MACBOX_SIM_PREFIX\")"
+  local id1 id2 kind name type want line udid state curtype n
+  id1="$(make_type "$PRO_BUNDLE" "$PRO_ID" 1)"
+  id2="$(make_type "$PRO_BUNDLE" "$PRO_ID" 2)"   # for 2x switching; not in the default pool
+  if ! simq type-known "$id1" || ! simq type-known "$id2"; then
+    restart_coresim_if_idle
+    simq type-known "$id1" || die "CoreSimulator doesn't list $id1 after a restart"
+  fi
+  for kind in $MACBOX_POOL; do
+    name="$(pool_name "$kind")"
+    case "$kind" in
+      full|slim-*) type="$id1" ;;
+      sharp) type="$PRO_ID" ;;
+      small) type="$SMALL_ID" ;;
+    esac
+    line="$(simq device "$name")"
+    if [ -n "$line" ]; then
+      IFS="$(printf '\t')" read -r udid state curtype <<< "$line"
+      if [ "$curtype" = "$type" ]; then ok "$name $udid"; else todo "$name has device type $curtype, the pool wants $type (left as it is)"; fi
+    else
+      udid="$(xcrun simctl create "$name" "$type" "$RUNTIME")"
+      did "$name $udid"
+    fi
+    want="$(kind_slim "$kind")"
+    n="$(slim_count "$udid")"
+    if [ ! -x "$HOME/go/bin/simslim" ]; then
+      [ "$want" = 1 ] && [ "$n" = 0 ] && todo "$name: slim it after \`macbox-guest tools\` (pool create again)"
+    elif [ "$want" = 1 ] && [ "$n" = 0 ]; then
+      say "  slimming $name (boots it once, then shuts it down; a minute or two)"
+      "$HOME/go/bin/simslim" on "$udid" --preserve-boot-state >/dev/null
+      did "$name slim ($(slim_count "$udid") services off)"
+    elif [ "$want" = 0 ] && [ "$n" != 0 ]; then
+      "$HOME/go/bin/simslim" off "$udid" --preserve-boot-state >/dev/null
+      did "$name back to stock services"
+    fi
+  done
+  if [ "$del_defaults" = 1 ]; then
+    while IFS="$(printf '\t')" read -r udid name; do
+      [ -n "$udid" ] || continue
+      xcrun simctl delete "$udid"
+      did "deleted CoreSimulator's default $name ($udid)"
+    done <<< "$(simq defaults)"
+  fi
+  pool_list
+}
+
+pool_list() {  # exits 1 when a simulator of the pool is missing
+  [ -n "${RUNTIME:-}" ] || pool_resolve
+  local kind name line udid state type n missing=0
+  for kind in $MACBOX_POOL; do
+    name="$(pool_name "$kind")"
+    line="$(simq device "$name")"
+    if [ -z "$line" ]; then printf '  %-7s missing  %s\n' "$kind" "$name"; missing=1; continue; fi
+    IFS="$(printf '\t')" read -r udid state type <<< "$line"
+    n="$(slim_count "$udid")"
+    printf '  %-7s %s  %-8s %s  [%s, %s]\n' "$kind" "$udid" "$state" "$name" "${type##*.}" \
+      "$([ "$n" = 0 ] && echo stock || echo "slim: $n off")"
+  done
+  return "$missing"
+}
+
+pool_delete() {
+  local yes=0 types=0 a kind name line udid state type
+  for a in "$@"; do
+    case "$a" in --yes) yes=1 ;; --types) types=1 ;; *) die "pool delete: unknown option $a" ;; esac
+  done
+  pool_resolve
+  for kind in $MACBOX_POOL; do
+    name="$(pool_name "$kind")"
+    line="$(simq device "$name")"
+    [ -n "$line" ] || continue
+    IFS="$(printf '\t')" read -r udid state type <<< "$line"
+    if [ "$yes" != 1 ]; then say "  would delete $name ($udid)"; continue; fi
+    xcrun simctl shutdown "$udid" 2>/dev/null || true
+    xcrun simctl delete "$udid"
+    did "deleted $name ($udid)"
+  done
+  if [ "$types" = 1 ]; then
+    for a in "$TYPES_DIR"/*" (1x).simdevicetype" "$TYPES_DIR"/*" (2x).simdevicetype"; do
+      [ -d "$a" ] || continue
+      case "$($PB -c 'Print :CFBundleIdentifier' "$a/Contents/Info.plist" 2>/dev/null)" in
+        dev.macbox.*) ;;
+        *) continue ;;
+      esac
+      if [ "$yes" = 1 ]; then rm -rf "$a"; did "removed device type $(basename "$a")"; else say "  would remove device type $(basename "$a")"; fi
+    done
+  fi
+  [ "$yes" = 1 ] || say "  (nothing deleted: add --yes)"
+}
+
+# ---------------------------------------------------------------- t3-hub
+# T3 Code installs expo-device-hub into ~/.t3/device/tools over SSH the first time its Device panel
+# opens this host. Its serve-sim native parts ship for Apple silicon only; this builds Intel copies
+# from the matching expo/expo-device-hub source and swaps them in.
+HUBS="$HOME/.t3/device/tools"
+
+hub_is_intel() {  # every Mach-O file of the installed hub is x86_64
+  ! find "$1" -type f -exec file {} + 2>/dev/null | grep 'Mach-O' | grep -qv x86_64
+}
+
+hub_fix() {
+  local v="$1" dir="$HUBS/expo-device-hub@$1" ref url src out vendor list f d
+  vendor="$dir/node_modules/expo-device-hub/vendor/serve-sim/dist"
+  [ -d "$vendor" ] || die "no installed hub $v"
+  if hub_is_intel "$dir"; then ok "hub $v is Intel already"; return 0; fi
+  # A canary is named <version>-canary-<date>-<commit>; a release has a tag.
+  if [[ "$v" =~ -canary-[0-9]+-([0-9a-f]{7,40})$ ]]; then
+    ref="${BASH_REMATCH[1]}"
+    url="https://api.github.com/repos/expo/expo-device-hub/tarball/$ref"
+  else
+    ref="expo-device-hub@$v"
+    url="https://codeload.github.com/expo/expo-device-hub/tar.gz/refs/tags/expo-device-hub%40$v"
+  fi
+  src="$SRC/edh-$v" out="$SRC/serve-sim-x86-$v/dist"
+  if [ ! -d "$src" ]; then
+    mkdir -p "$src.part"
+    curl -fsSL "$url" | tar -xz -C "$src.part" --strip-components=1
+    mv "$src.part" "$src"
+  fi
+  say "  building hub $v's native parts for Intel from $ref (a few minutes; log $SRC/build-$v.log)"
+  "$ROOT/bin/build-serve-sim-x86.sh" "$src" "$out" > "$SRC/build-$v.log" 2>&1 || { tail -20 "$SRC/build-$v.log" >&2; die "build failed"; }
+  # Swap every Mach-O file the package ships for the one built here, by relative path.
+  list="$(mktemp)"
+  (cd "$vendor" && find . -type f -exec file {} + | awk -F: '/Mach-O/ {print $1}') > "$list"
+  while IFS= read -r f; do
+    case "$f" in ./bin/LiveKitWebRTC.framework/*|./simpb/ServeSimPasteboard.app/*) continue ;; esac
+    [ -f "$out/$f" ] || { rm -f "$list"; die "not built: $f"; }
+    cp -f "$out/$f" "$vendor/$f"
+  done < "$list"
+  rm -f "$list"
+  for d in bin/LiveKitWebRTC.framework simpb/ServeSimPasteboard.app; do
+    [ -d "$vendor/$d" ] || continue
+    rm -rf "${vendor:?}/$d"; cp -a "$out/$d" "$vendor/$d"
+  done
+  hub_is_intel "$dir" || die "still arm64 files in $dir"
+  node -e "require('$vendor/native/serve-sim-native.node')"
+  # T3 starts the hub again by itself when the panel next asks.
+  pkill -f "expo-device-hub@$v/node_modules/expo-device-hub/dist/server/cli.mjs" 2>/dev/null || true
+  did "hub $v: Intel build installed (T3 restarts it on its next use)"
+}
+
+cmd_t3hub() {
+  say "== T3 Code device hub"
+  xcode_status >/dev/null || die "install Xcode first (macbox-guest xcode)"
+  have node || die "Node is missing: macbox-guest tools"
+  mkdir -p "$SRC"
+  if [ $# -gt 0 ]; then hub_fix "$1"; return; fi
+  local d found=0
+  for d in "$HUBS"/expo-device-hub@*; do
+    [ -d "$d" ] || continue
+    found=1
+    hub_fix "${d##*/expo-device-hub@}"
+  done
+  [ "$found" = 1 ] || todo "no hub yet: open this Mac in T3 Code's Device panel once (T3 installs the hub over SSH), then run this again"
+}
+
+# ---------------------------------------------------------------- stream-settings
+SS_LABEL=dev.macbox.sim-stream-settings
+SS_PLIST="$HOME/Library/LaunchAgents/$SS_LABEL.plist"
+
+ss_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SS_LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$MB/bin/sim-stream-settings.sh</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>MACBOX_STREAM_BITRATE</key><string>${MACBOX_STREAM_BITRATE:-1200000}</string>
+    <key>MACBOX_STREAM_FPS</key><string>${MACBOX_STREAM_FPS:-30}</string>
+  </dict>
+  <key>StartInterval</key><integer>20</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/macbox-sim-stream-settings.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/macbox-sim-stream-settings.log</string>
+</dict>
+</plist>
+EOF
+}
+
+ss_loaded() { launchctl print "gui/$(id -u)/$SS_LABEL" >/dev/null 2>&1; }
+
+cmd_stream_settings() {
+  case "${1:-status}" in
+    install)
+      [ -f "$MB/bin/sim-stream-settings.sh" ] || die "no $MB/bin/sim-stream-settings.sh (copy guest/ to ~/.macbox first)"
+      mkdir -p "$(dirname "$SS_PLIST")"
+      if [ -f "$SS_PLIST" ] && [ "$(cat "$SS_PLIST")" = "$(ss_plist)" ] && ss_loaded; then
+        ok "stream settings agent ($SS_LABEL)"; return
+      fi
+      ss_plist > "$SS_PLIST"
+      launchctl bootout "gui/$(id -u)/$SS_LABEL" 2>/dev/null || true
+      if launchctl bootstrap "gui/$(id -u)" "$SS_PLIST" 2>/dev/null; then
+        did "stream settings agent ($SS_LABEL): H.264 at ${MACBOX_STREAM_BITRATE:-1200000} bit/s, ${MACBOX_STREAM_FPS:-30} frames/s"
+      else
+        did "stream settings agent written; it starts at the next login (no desktop session yet)"
+      fi
+      ;;
+    remove)
+      launchctl bootout "gui/$(id -u)/$SS_LABEL" 2>/dev/null || true
+      if [ -f "$SS_PLIST" ]; then rm -f "$SS_PLIST"; did "removed $SS_LABEL"; else ok "no $SS_LABEL"; fi
+      ;;
+    status)
+      if ss_loaded; then ok "stream settings agent loaded"; elif [ -f "$SS_PLIST" ]; then todo "stream settings agent installed, not loaded (next login)"; else todo "stream settings agent: macbox-guest stream-settings install"; fi
+      ;;
+    *) die "usage: macbox-guest stream-settings install|remove|status" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- doctor
+check() {  # check <ok?> <text when ok> <text when not>
+  if [ "$1" = 1 ]; then ok "$2"; else todo "$3"; fi
+}
+is() { if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
+
+cmd_doctor() {
+  local v n
+  say "== macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m), user $USER, $(df -h "$HOME" | awk 'NR == 2 {print $4}') free"
+  check "$(is sh -c 'sudo -n -l | grep -q "NOPASSWD: ALL"')" "sudo without a password" "sudo asks for a password: macbox-guest base"
+  check "$(is test "$(defaults read /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE 2>/dev/null)" = 5)" \
+    "METAL_ERROR_MODE 5" "METAL_ERROR_MODE is not 5: macbox-guest base"
+  check "$(is test "$(pmset -g | awk '$1 == "sleep" {print $2}')" = 0)" "no sleep" "macOS sleeps: macbox-guest base"
+  check "$(is sh -c 'mdutil -s / | grep -qi disabled')" "Spotlight indexing off" "Spotlight indexes: macbox-guest base"
+  check "$(is test "$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload 2>/dev/null)" = 0)" \
+    "automatic update downloads off" "macOS downloads updates by itself: macbox-guest base"
+  check "$(is sh -c 'sysadminctl -screenLock status 2>&1 | grep -q "is off"')" "screen lock off" "screen lock on: macbox-guest base (with ssh -t)"
+  check "$(is test "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)" = "$USER")" \
+    "automatic login as $USER" "no automatic login: macbox-guest base --autologin"
+  check "$(is grep -q '^# >>> macbox >>>' "$HOME/.zshenv")" "PATH block in ~/.zshenv" "no PATH block: macbox-guest base"
+  v="$(/usr/local/bin/node -v 2>/dev/null || true)"; check "$(is test -n "$v")" "Node $v" "no Node: macbox-guest tools"
+  v="$("$HOME/.local/portable-ruby/current/bin/ruby" -e 'print RUBY_VERSION' 2>/dev/null || true)"
+  check "$(is test -n "$v")" "Ruby $v (portable)" "no portable Ruby: macbox-guest tools"
+  v="$(PATH="$HOME/.local/portable-ruby/current/bin:$HOME/.local/share/gem/ruby/$(ruby_abi)/bin:$PATH" LANG=en_US.UTF-8 pod --version 2>/dev/null || true)"
+  check "$(is test -n "$v")" "CocoaPods $v" "no CocoaPods: macbox-guest tools"
+  v="$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')"; check "$(is test -n "$v")" "Go ${v#go}" "no Go: macbox-guest tools"
+  v="$(/usr/local/go/bin/go version -m "$HOME/go/bin/simslim" 2>/dev/null | awk '$1 == "mod" {print $3}')"
+  check "$(is test -n "$v")" "simslim $v" "no simslim: macbox-guest tools"
+  check "$(is test -x "$MB/bin/setmode")" "setmode" "no setmode: macbox-guest tools (after Xcode)"
+  if xcode_status; then
+    v="$(ios_runtimes | sed 's/ - com.apple.*//' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+    check "$(is test -n "$v")" "runtime $v" "no iOS Simulator runtime: macbox-guest runtime"
+    if [ -n "$v" ]; then
+      n="$(grep -l 'dev\.macbox\.CoreSimulator' "$TYPES_DIR"/*.simdevicetype/Contents/Info.plist 2>/dev/null | wc -l | tr -d ' ')"
+      check "$(is test "$n" -gt 0)" "macbox device types (1x, 2x)" "no macbox 1x device type: macbox-guest pool create"
+      say "  pool ($MACBOX_POOL; prefix \"$MACBOX_SIM_PREFIX\"):"; pool_list || true
+    fi
+  fi
+  local d found=0
+  for d in "$HUBS"/expo-device-hub@*; do
+    [ -d "$d" ] || continue
+    found=1
+    check "$(is hub_is_intel "$d")" "T3 hub ${d##*/expo-device-hub@} on Intel" "T3 hub ${d##*/expo-device-hub@} is arm64: macbox-guest t3-hub"
+  done
+  [ "$found" = 1 ] || todo "no T3 Code device hub yet (T3 installs it when its Device panel first opens this Mac)"
+  cmd_stream_settings status
+}
+
+case "${1:-help}" in
+  base) shift; cmd_base "$@" ;;
+  tools) cmd_tools ;;
+  xcode) shift; cmd_xcode "$@" ;;
+  runtime) shift; cmd_runtime "$@" ;;
+  pool) shift; cmd_pool "$@" ;;
+  t3-hub) shift; cmd_t3hub "$@" ;;
+  stream-settings) shift; cmd_stream_settings "$@" ;;
+  doctor) cmd_doctor ;;
+  help|-h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0" ;;
+  *) die "unknown command $1 (macbox-guest help)" ;;
+esac

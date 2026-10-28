@@ -1,0 +1,108 @@
+From 8808e19fccab471f8f967949b68c4db036432c43 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 14:39:45 +0000
+Subject: [PATCH 2/3] REIMS_VGPU_NON_APPLE_GPU takes a list of
+ parts
+
+---
+ crates/reims-vgpu-vulkan/src/gpu/caps.rs | 47 +++++++++++++-----------
+ 1 file changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/caps.rs b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
+index a785e63..2def509 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/caps.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/caps.rs
+@@ -181,21 +181,26 @@ const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
+ /// The stand-ins: the Metal platform's answers on an Apple M3 Max, where no documented fact
+ /// gives one (the module's table). The registry ID, which Metal answers at run time, is the
+ /// OS's ([`crate::os::default_registry_id`]).
+-/// macbox: `REIMS_VGPU_NON_APPLE_GPU=1` answers the guest as Apple's framework does on an
+-/// Intel or AMD Mac's GPU: no Apple GPU family (device info key 28 bit 0 off, key 37 Apple5's
+-/// fallback 1005, key 44 none), and no tile shaders, imageblocks, raster order groups,
+-/// framebuffer reads or extended XR10 formats, so the guest's compositor takes the paths it
+-/// takes on an immediate-mode GPU instead of a tiler's, which this platform emulates at a cost.
+-/// Read at device creation; a guest sees the new answers from its next cold boot.
+-pub fn non_apple_gpu() -> bool {
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| {
+-        let on = std::env::var_os("REIMS_VGPU_NON_APPLE_GPU").is_some_and(|v| v == "1");
+-        if on {
+-            log::info!("REIMS_VGPU_NON_APPLE_GPU: answering as a GPU of no Apple family (no tile shaders, imageblocks, raster order groups, framebuffer reads, XR10)");
++/// macbox: `REIMS_VGPU_NON_APPLE_GPU` answers the guest as Apple's framework does on an
++/// Intel or AMD Mac's GPU, part by part, so the guest's compositor takes an immediate-mode GPU's
++/// paths instead of a tiler's, which this platform emulates at a cost. Its value is `1` or `all`
++/// for every part, or a comma list of: `families` (no Apple GPU family: device info key 28 bit 0
++/// off, key 37 Apple5's fallback 1005, key 44 none), `tile` (no tile shaders), `imageblocks`,
++/// `rog` (no raster order groups), `fbread` (no framebuffer reads) and `xr10` (no extended XR10
++/// formats). Read once, at device creation; a guest sees new answers from its next cold boot.
++/// `fbread` breaks WindowServer here: the guest's plugin always answers memoryless render targets
++/// yes, and without framebuffer reads WindowServer reads them across passes, which Metal fails.
++pub fn non_apple_gpu(part: &str) -> bool {
++    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++    let parts = PARTS.get_or_init(|| {
++        let v = std::env::var("REIMS_VGPU_NON_APPLE_GPU").unwrap_or_default();
++        let parts: Vec<String> = v.split(',').map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()).collect();
++        if !parts.is_empty() {
++            log::info!("REIMS_VGPU_NON_APPLE_GPU={v}: answering these parts as a GPU of no Apple family");
+         }
+-        on
+-    })
++        parts
++    });
++    parts.iter().any(|p| p == "1" || p == "all" || p == part)
+ }
+ 
+ pub mod stand_in {
+@@ -338,7 +343,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
+         max_viewport_count: count(C::MaxViewportCount),
+     };
+     let flags = Flags {
+-        are_raster_order_groups_supported: !non_apple_gpu()
++        are_raster_order_groups_supported: !non_apple_gpu("rog")
+             && query("areRasterOrderGroupsSupported", props.are_raster_order_groups_supported()),
+         is_depth24_stencil8_pixel_format_supported: query(
+             "isDepth24Stencil8PixelFormatSupported",
+@@ -354,7 +359,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
+         // refuses per pipeline (`NotImplemented(Format)`), which dies at the pipeline's
+         // creation. An answer stays as it was until the guests boot with the new one, so this
+         // one stays the compile layer's.
+-        is_framebuffer_read_supported: !non_apple_gpu() && !refuses(Feature::FramebufferFetch),
++        is_framebuffer_read_supported: !non_apple_gpu("fbread") && !refuses(Feature::FramebufferFetch),
+         is_large_mrt_supported: flag(F::IsLargeMrtSupported),
+         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,
+         supports_buffer_with_address_ranges: imports_host_memory,
+@@ -365,13 +370,13 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
+         supports_compute_compressed_texture_write: flag(F::SupportsComputeCompressedTextureWrite),
+         supports_conditional_load_store: flag(F::SupportsConditionalLoadStore),
+         supports_dynamic_attribute_stride: flag(F::SupportsDynamicAttributeStride),
+-        supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS && !non_apple_gpu(),
++        supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS && !non_apple_gpu("xr10"),
+         supports_float16_bcubic_filtering: stand_in::FLOAT16_BCUBIC_FILTERING,
+         supports_heap_with_address_ranges: imports_host_memory,
+-        supports_image_blocks: stand_in::IMAGE_BLOCKS && !non_apple_gpu(),
++        supports_image_blocks: stand_in::IMAGE_BLOCKS && !non_apple_gpu("imageblocks"),
+         supports_memory_order_atomics: memory_order_atomics(private),
+         supports_native_hardware_fp16: props.description.has(VkFeature::ShaderFloat16),
+-        supports_non_square_tile_shaders: stand_in::TILE_SHADERS && !non_apple_gpu(),
++        supports_non_square_tile_shaders: stand_in::TILE_SHADERS && !non_apple_gpu("tile"),
+         supports_programmable_sample_positions: query(
+             "areProgrammableSamplePositionsSupported",
+             props.are_programmable_sample_positions_supported(),
+@@ -382,7 +387,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
+         supports_simd_reduction: simd_reduction,
+         supports_simd_shuffle_and_fill: simd_shuffle_and_fill,
+         supports_texture_2d_multisample_array: stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY,
+-        supports_tile_shaders: stand_in::TILE_SHADERS && !non_apple_gpu(),
++        supports_tile_shaders: stand_in::TILE_SHADERS && !non_apple_gpu("tile"),
+     };
+     let amplification = amplification.min(count(C::MaxVertexAmplificationCount));
+     (amplification, limits, flags)
+@@ -472,7 +477,7 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
+                     .unwrap_or(false),
+             })
+         }),
+-        families: if non_apple_gpu() { [false; 7] } else { stand_in::FAMILIES }.map(Ok),
++        families: if non_apple_gpu("families") { [false; 7] } else { stand_in::FAMILIES }.map(Ok),
+         write_rounding_modes: WRITE_ROUNDING_MODES
+             .map(|mode| Ok(props.supports_texture_write_rounding_mode(mode.cast_unsigned()))),
+         heap_buffer_page_private: heap_buffer_size_and_align(device, page_size, HEAP_QUERY_OPTIONS),

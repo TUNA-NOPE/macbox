@@ -1,0 +1,992 @@
+From 0cb65c2d01e8fc3fd3eb6dc68feb1e55fb0d787e Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 19:40:43 +0000
+Subject: [PATCH 5/5] order uses through two imports of the same
+ pages with MEMORY_WRITE; keep a remapped memory whose imports follow their
+ address
+
+The host_rt_in_place failure (surface_aliases'
+a_second_buffer_that_joined_nothing_reads_what_the_first_wrote, AfterRemap
+in one command buffer: ~2% stale texels) was not a missing barrier: the
+tracker recorded COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE ->
+TRANSFER/TRANSFER_READ (and -> COMPUTE/SHADER_READ for the kernel reader),
+the same barrier the Made and Rebound arrivals get, which read fresh. They
+lie in one import; a buffer made after host_range_remapped imports the pages
+anew, a second VkDeviceMemory at its own GPU address, and on ANV (Mesa
+26.2.4, Arrow Lake, i915) the pass's color writes stayed in L3 under the
+first's address. Measured on the lane, AfterRemap only: src |= MEMORY_WRITE
+on those barriers, or dst |= MEMORY_WRITE (both ANV's full flush, the tile
+cache's among it): fresh; dst |= MEMORY_READ (every cache invalidated):
+still stale.
+
+- host_aliases.rs: each placement notes the import its key lies in
+  (import_note: the HostImport's address; 0 not known). A use added for a
+  key of another import (a range met, a key of its range in another import,
+  a joined buffer made at once with an import of its own) takes MEMORY_WRITE
+  among the access types of its reads and writes (apart), so every barrier
+  between it and a use of the key it is added for carries ANV's full flush.
+  Keys in one import (joined, rebound: the usual display surface) take
+  nothing. In-pass barriers mask access types to their subpass's
+  dependency, so nothing changes there. Always on: the hazard is the
+  driver's, whatever the switch (blorp's color writes through one import
+  would meet it too).
+- Dedupe after a remap (the join this case escaped): host_range_remapped
+  ended every memory it touched, as an import made before may keep the old
+  pages. On a driver whose pointer imports follow their address
+  (DriverFact::PointerImportsFollowTheirAddress, live-switchable) a memory
+  whose live imports are all by pointer now stays (remapped_keeping,
+  HostImport::by_pointer): a later buffer over the bytes joins its key and
+  lies in its import. ARL's device lacks the fact (not in M2V_ARL_FACTS),
+  so on the reference host the barrier above is what fixes it; with
+  facts_on=PointerImportsFollowTheirAddress the buffer lies in one import.
+- host_rt::orders_images: an image use takes its key's bytes while the
+  switch is on and once a texture was made in place under it, so turning
+  the switch off keeps ordering those images.
+
+Lanes (Arrow Lake, M2V_LANE_IN_PLACE=1): the failing lane passes with
+host_rt_in_place=1 (all three arrivals); the 323-lane set with the switch
+on: 301 passed, 22 failed (the 17 linear clear-rounding lanes, the 2 that
+assert shadows, the 3 baseline failures; the same messages as before);
+off: 320 passed, the 3 baseline failures. With
+facts_on=PointerImportsFollowTheirAddress: surface_aliases and the
+host_memory remap lanes pass. Runtime unit tests tests::host_aliases (3
+new) pass; tests::host_import_counts' remap count follows the fact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/buffer.rs     |   7 +
+ .../src/buffer_descriptor.rs                  |  46 +++-
+ .../metal2vulkan-runtime/src/host_aliases.rs  | 225 ++++++++++++++----
+ crates/metal2vulkan-runtime/src/host_rt.rs    |  26 +-
+ .../src/tests/host_aliases.rs                 | 175 ++++++++++++--
+ .../src/tests/host_import_counts.rs           |   9 +-
+ crates/metal2vulkan-runtime/src/texture.rs    |   1 +
+ .../src/runtime_lane/surface_aliases.rs       |  10 +-
+ 8 files changed, 413 insertions(+), 86 deletions(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index 169f4307..57d569a8 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -1123,6 +1123,13 @@ impl HostImport {
+         self.shape.drops_writes
+     }
+ 
++    /// macbox: whether its pages were imported by their pointer, neither as dma-bufs nor
++    /// through a read-only view: an import that follows its address where the driver's pointer
++    /// imports do (`host_aliases.rs`).
++    pub(super) fn by_pointer(&self) -> bool {
++        !self.shape.over_dma_buf && !self.shape.drops_writes
++    }
++
+     /// Its residency, where the device may release it while idle.
+     #[cfg(unix)]
+     pub(super) fn residency(&self) -> Option<&Residency> {
+diff --git a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+index 9045fd4d..51b73aac 100644
+--- a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+@@ -34,6 +34,7 @@ use super::texture::Remade;
+ use super::values::{ResourceOptions, StorageMode};
+ use super::work_counts::Counters;
+ use super::Device;
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use crate::release;
+ use ash::vk;
+ use std::ptr::NonNull;
+@@ -358,13 +359,17 @@ impl Device {
+     /// none. A `length` of 0 tells nothing.
+     ///
+     /// The call may come at the unmap or after the new map, but before a buffer is made over the
+-    /// new pages: a buffer made over those bytes while it runs may lie in either pages. The bytes
+-    /// are an address range only, never read: they may be unmapped, and may cover a whole
+-    /// reservation of many buffers. The call is safe from any thread while other calls run on
+-    /// others, a no-copy buffer's deallocator among them (the runtime holds no lock this call
+-    /// takes while it runs a deallocator). It is cheap: with no no-copy buffer live it returns at
+-    /// once, and otherwise it finds the buffers over the range by address, whether the range
+-    /// covers none of them or many, never reading them all.
++    /// new pages: a buffer made over those bytes while it runs may lie in either pages. LOCAL
++    /// (macbox): where the driver's pointer imports follow their address, a live buffer's import of
++    /// the pointer reads the new pages from the call on, as a new import would: a buffer made
++    /// after the call over the bytes a live one was made over, of its memory class, lies in its
++    /// import still, and joins its key, unless an import of the memory is of dma-bufs
++    /// (`host_aliases.rs`). The bytes are an address range only, never read: they may be unmapped,
++    /// and may cover a whole reservation of many buffers. The call is safe from any thread while
++    /// other calls run on others, a no-copy buffer's deallocator among them (the runtime holds no
++    /// lock this call takes while it runs a deallocator). It is cheap: with no no-copy buffer
++    /// live it returns at once, and otherwise it finds the buffers over the range by address,
++    /// whether the range covers none of them or many, never reading them all.
+     pub fn host_range_remapped(&self, bytes: NonNull<u8>, length: u64) {
+         let start = bytes.as_ptr() as u64;
+         let shared = self.shared();
+@@ -372,7 +377,15 @@ impl Device {
+         // covers is taken anew at its next submission.
+         let unit = (shared.host_import.as_ref())
+             .map_or(1, |importer| importer.page.max(importer.alignment));
+-        let imports = (shared.aliases).remapped(start, start.saturating_add(length), unit);
++        // macbox: on a driver whose pointer imports follow their address, a memory whose
++        // imports are all of the pointer stays: they read the new pages from the remap on, as
++        // an import made after it would, so a later buffer over the bytes lies in one of them
++        // (`host_aliases.rs`).
++        let follows = (self.properties().driver_facts)
++            .live_has(metal2vulkan::device::DriverFact::PointerImportsFollowTheirAddress);
++        let keeps = |import: &super::buffer::HostImport| follows && import.by_pointer();
++        let end = start.saturating_add(length);
++        let imports = (shared.aliases).remapped_keeping(start, end, unit, keeps);
+         shared.counts.host_range_remapped(imports);
+     }
+ 
+@@ -498,7 +511,9 @@ impl Device {
+             shared
+                 .aliases
+                 .join(buffer.identity().key, made_over, class, &import);
+-            shared.aliases.place(buffer.identity().key, made_over);
++            // macbox: placed with the import it lies in (`host_aliases.rs`).
++            let note = super::host_aliases::import_note(&import);
++            shared.aliases.place(buffer.identity().key, made_over, note);
+             return Ok(buffer);
+         }
+         // Only a buffer that imports its pages pins them, and so has their writability asked: one
+@@ -564,6 +579,9 @@ impl Device {
+         // a later one lies in its import; one whose GPU writes are dropped joins none.
+         // A buffer just made lies in its pages (`HostCell::current`).
+         let current = buffer.host_cell().and_then(|cell| cell.current());
++        // macbox: the import it lies in, which it is placed with (`host_aliases.rs`).
++        let note =
++            (current.as_ref()).map_or(0, |pages| super::host_aliases::import_note(pages.import()));
+         if let (false, false, Some(current)) = (of_heap, drops_writes, current) {
+             shared
+                 .aliases
+@@ -571,7 +589,7 @@ impl Device {
+         }
+         // Its uses order against every other key's over bytes they meet, a heap's own buffer's
+         // too (`host_aliases.rs`).
+-        shared.aliases.place(buffer.identity().key, made_over);
++        shared.aliases.place(buffer.identity().key, made_over, note);
+         Ok(buffer)
+     }
+ 
+@@ -752,8 +770,12 @@ impl Device {
+         shared.live_buffers.rebound(buffer, heap);
+         // Later buffers over the memory it was made over no longer join it.
+         shared.aliases.leave(key);
+-        // Its uses from now on order against the keys over the new bytes.
+-        shared.aliases.place(key, (pointer.as_ptr() as u64, length));
++        // Its uses from now on order against the keys over the new bytes; macbox: placed
++        // with the import of its new pages (`host_aliases.rs`).
++        let note = super::host_aliases::import_note(pages.import());
++        shared
++            .aliases
++            .place(key, (pointer.as_ptr() as u64, length), note);
+         if let Some(release) = release.of(pointer, length) {
+             pages.release_to(release);
+         }
+diff --git a/crates/metal2vulkan-runtime/src/host_aliases.rs b/crates/metal2vulkan-runtime/src/host_aliases.rs
+index 11b17838..330c0690 100644
+--- a/crates/metal2vulkan-runtime/src/host_aliases.rs
++++ b/crates/metal2vulkan-runtime/src/host_aliases.rs
+@@ -80,13 +80,37 @@
+ //!   (`WorkCounts::host_imports_remapped`). The lock is a leaf: nothing else is locked, and no buffer, pages hold or
+ //!   deallocator is dropped, while it is held (the imports noted are weak), so the call may be
+ //!   made from any thread, a deallocator's among them.
++//! - **macbox: a remap over imports that follow their address.** On a driver whose pointer
++//!   imports follow their address (`DriverFact::PointerImportsFollowTheirAddress`), an import of
++//!   the pointer reads the pages mapped there at each submission, the new ones from a remap on, as
++//!   an import made after it would. There a reported remap keeps a memory whose every live
++//!   import is by pointer ([`HostAliases::remapped_keeping`]): a later buffer over the same bytes
++//!   joins its key and lies in its import, one `VkDeviceMemory` again, where it would otherwise
++//!   import the same pages anew. A memory with an import of dma-bufs (which keeps its pages)
++//!   still ends.
++//! - **macbox: two imports of the same pages.** Each import is a `VkDeviceMemory` of its
++//!   own, mapped at a GPU address of its own, and on ANV (Mesa 26.2.4, the Arrow Lake iGPU) a
++//!   barrier from a pass's color writes through one to a read through another of the same pages
++//!   left about 2% of the texels stale within one submission: those still in the GPU's L3 under
++//!   the writer's address. A barrier whose access types hold `MEMORY_WRITE` on either side
++//!   (ANV's full flush, the tile cache's among it) read them all fresh; one that adds
++//!   `MEMORY_READ` to the reads (every cache invalidated) did not (`surface_aliases`, a texture
++//!   rendered in place, `host_rt.rs`). So each placement notes the import its key lies in, and a
++//!   use added for a key of another import (another range met, or a key of its range in another
++//!   import: one made after a remap, a heap's own buffer, another memory class) takes
++//!   `MEMORY_WRITE` among the access types of its reads and of its writes ([`apart`]): a barrier
++//!   between it and any use of the key it is added for carries it. Uses of keys in one import (a
++//!   joined buffer's, a rebound one's) take nothing. Its cost is that full flush in the barriers
++//!   of the keys over pages another import holds, their barriers within one import too (both
++//!   take the added uses).
+ 
+ use super::buffer::HostImport;
+ use super::device::lock;
+ use super::key_hash::KeyMap;
+ use super::memory::MemoryClass;
+ use super::resource::ResourceKey;
+-use super::tracker::{Use, UseRange};
++use super::tracker::{Access, Use, UseRange};
++use ash::vk;
+ use std::cell::Cell;
+ use std::collections::BTreeMap;
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+@@ -279,6 +303,13 @@ impl<I> HostAliases<I> {
+         }
+     }
+ 
++    /// macbox: [`remapped_keeping`](Self::remapped_keeping), keeping no memory (the
++    /// tests' form, upstream's call).
++    #[cfg(test)]
++    pub(super) fn remapped(&self, start: u64, end: u64, unit: u64) -> usize {
++        self.remapped_keeping(start, end, unit, |_| false)
++    }
++
+     /// The caller replaced the pages under the host addresses `start..end`
+     /// (`Device::host_range_remapped`): every live buffer made over memory with a byte among
+     /// them leaves it, as a rebound buffer does ([`HostAliases::leave`]), keeping its pages, its
+@@ -292,16 +323,40 @@ impl<I> HostAliases<I> {
+     /// have a page among those `start..end` covers, rounded out to `unit` bytes, the import's
+     /// unit: the imports whose pages the replacement touches, which a driver's import by pointer
+     /// takes anew at its next submission (`WorkCounts::host_imports_remapped`).
+-    pub(super) fn remapped(&self, start: u64, end: u64, unit: u64) -> usize {
++    ///
++    /// macbox: but a memory each of whose live imports `keeps` (an import of the pointer
++    /// on a driver whose pointer imports follow their address, which reads the pages the remap
++    /// put there: the module docs) stays, so a later buffer over its bytes joins it and lies in
++    /// its import. A memory with no live import ends.
++    pub(super) fn remapped_keeping(
++        &self,
++        start: u64,
++        end: u64,
++        unit: u64,
++        keeps: impl Fn(&I) -> bool,
++    ) -> usize {
+         if start >= end
+             || (self.noted.load(Ordering::Relaxed) == 0 && self.placed.load(Ordering::Relaxed) == 0)
+         {
+             return 0;
+         }
++        // The imports looked at, dropped once the lock is let go: an import's last hold dropped
++        // under it would free it, and run deallocators, under the leaf lock.
++        let mut looked: Vec<Arc<I>> = Vec::new();
+         let mut inner = lock(&self.inner);
+-        let ended: Vec<(u64, u64)> = inner.memories.overlapping(start, end).collect();
+-        for memory in ended {
+-            inner.memories.remove(memory);
++        let overlapping: Vec<(u64, u64)> = inner.memories.overlapping(start, end).collect();
++        for memory in overlapping {
++            let kept = inner.memories.get(memory).is_some_and(|noted| {
++                let live: Vec<Arc<I>> = (noted.imports.iter())
++                    .filter_map(|(_, import)| import.upgrade())
++                    .collect();
++                let kept = !live.is_empty() && live.iter().all(|import| keeps(import));
++                looked.extend(live);
++                kept
++            });
++            if !kept {
++                inner.memories.remove(memory);
++            }
+         }
+         self.noted.store(inner.memories.len(), Ordering::Relaxed);
+         // An import's pages are its bytes rounded out to the unit: one has a page the remap
+@@ -309,7 +364,10 @@ impl<I> HostAliases<I> {
+         let unit = unit.max(1);
+         let from = start - start % unit;
+         let to = end.div_ceil(unit).saturating_mul(unit);
+-        inner.placements.ranges.overlapping(from, to).count()
++        let touched = inner.placements.ranges.overlapping(from, to).count();
++        drop(inner);
++        drop(looked);
++        touched
+     }
+ 
+     /// Whether the bytes `start..end`, rounded out to `unit` bytes, the import's unit, lie within
+@@ -355,11 +413,12 @@ impl<I> HostAliases<I> {
+     /// The buffer of `key` (a no-copy buffer, or a no-copy heap's own buffer, whose uses are of
+     /// bytes counted from its first) lies over the host bytes `at` (its first byte's address and
+     /// its length) from now on, made or rebound there, and no longer where it lay before
+-    /// ([`Placements`]).
+-    pub(super) fn place(&self, key: ResourceKey, at: (u64, u64)) {
++    /// ([`Placements`]). macbox: in the import `import` names (its address; 0 for one not
++    /// known, which no other import is taken to be: the module docs).
++    pub(super) fn place(&self, key: ResourceKey, at: (u64, u64), import: u64) {
+         let mut inner = lock(&self.inner);
+         inner.placements.unplace(key);
+-        inner.placements.place(key, at);
++        inner.placements.place(key, at, import);
+         self.crowded
+             .store(inner.placements.crowded(), Ordering::Relaxed);
+         (self.placed).store(inner.placements.ranges.len(), Ordering::Relaxed);
+@@ -425,6 +484,12 @@ impl<I> HostAliases<I> {
+     }
+ }
+ 
++/// macbox: the note of `import` in the placements: its address, which no other live
++/// import shares (the module docs).
++pub(super) fn import_note<I>(import: &Arc<I>) -> u64 {
++    Arc::as_ptr(import) as usize as u64
++}
++
+ /// One live buffer less over the memory `over` names: the memory is forgotten with its last,
+ /// unless a remap ended it already.
+ fn release<I>(memories: &mut Memories<Memory<I>>, over: Over) {
+@@ -461,13 +526,15 @@ pub(super) fn augmented(
+     // buffer) takes the uses of every byte the key lies over: a render pass's write through one
+     // import of a surface's pages is ordered before a read through another import of them (the
+     // `surface_aliases` lane's surface made after a remap), as a byte use is. It orders more than
+-    // the texels need, never less. Asked once a call, at its first image use.
++    // the texels need, never less. Asked once a call, at its first image use: while the switch
++    // is on, and once any such texture was made in place (its image keeps its form when the
++    // switch goes off).
+     let mut images = None;
+     let whole = 0..u64::MAX;
+     for used in uses {
+         let bytes = match &used.range {
+             UseRange::Bytes(bytes) => bytes,
+-            UseRange::Image { .. } if *images.get_or_insert_with(crate::host_rt::switched) => {
++            UseRange::Image { .. } if *images.get_or_insert_with(crate::host_rt::orders_images) => {
+                 &whole
+             }
+             UseRange::Image { .. } => continue,
+@@ -481,36 +548,68 @@ pub(super) fn augmented(
+                 UseRange::Image { .. } => UseRange::Bytes(whole.clone()),
+                 range => range.clone(),
+             };
+-            add(Use {
+-                key,
+-                range,
+-                ..used.clone()
+-            });
++            // macbox: a buffer that joined a memory lies in its import but where two
++            // were made over it at once (the module docs): one placed in another import than
++            // the memory's key's is apart.
++            let other = placements.is_some_and(|placements| placements.apart(used.key, key));
++            add(apart(
++                Use {
++                    key,
++                    range,
++                    ..used.clone()
++                },
++                other,
++            ));
+         }
+         let Some(placements) = placements else {
+             continue;
+         };
+-        placements.sharing(used.key, bytes, |key, range| {
++        placements.sharing(used.key, bytes, |key, range, other| {
+             // The memory's key carries the same bytes already.
+             if Some(key) != joined || range != *bytes {
+-                add(Use {
+-                    key,
+-                    range: UseRange::Bytes(range),
+-                    ..used.clone()
+-                });
++                add(apart(
++                    Use {
++                        key,
++                        range: UseRange::Bytes(range),
++                        ..used.clone()
++                    },
++                    other,
++                ));
+             }
+         });
+     }
+     !all.is_empty()
+ }
+ 
++/// macbox: `used`, a use added for a key of another import of the same pages where
++/// `other` (the module docs), with `MEMORY_WRITE` among the access types of its reads and of its
++/// writes: a barrier between it and any use of the key it is added for then carries
++/// `MEMORY_WRITE` on its side, which ANV takes as its full flush, so a write through one import
++/// is in the pages before a read through the other. Its stages stay its own (`MEMORY_WRITE` is
++/// valid in every stage), and a barrier inside a render pass keeps to its subpass's dependency,
++/// which masks the access types (`render_target.rs`).
++fn apart(mut used: Use<ResourceKey>, other: bool) -> Use<ResourceKey> {
++    if !other {
++        return used;
++    }
++    let strong = |side: Access| match side.is_empty() {
++        true => side,
++        false => Access::new(side.stages, side.access | vk::AccessFlags2::MEMORY_WRITE),
++    };
++    used.read = strong(used.read);
++    used.write = strong(used.write);
++    used
++}
++
+ /// The bytes each buffer over host pages lies over now, by key, and the ranges of bytes some key
+ /// lies over, each with the key its keys' uses share: the first placed there, while any key lies
+ /// there (the module docs).
+ #[derive(Default)]
+ pub(super) struct Placements {
+-    /// Each placed key's bytes: their first byte's host address and their length.
+-    at: KeyMap<ResourceKey, (u64, u64)>,
++    /// Each placed key's bytes: their first byte's host address and their length; LOCAL
++    /// (macbox): and the import it lies in ([`import_note`]; 0: not known, apart from every
++    /// other).
++    at: KeyMap<ResourceKey, ((u64, u64), u64)>,
+     /// Each range of bytes some key lies over, by its first byte's address and its length.
+     ranges: Memories<Placed>,
+     /// How many ranges are crowded ([`Placed::crowded`]).
+@@ -527,9 +626,13 @@ struct Placed {
+     keys: usize,
+     /// Whether its key lies over it still.
+     first: bool,
++    /// macbox: the import its key lies in, kept once the key went: the key's uses still
++    /// recorded lie there, and hold the import, whose address no other import takes meanwhile.
++    import: u64,
+     /// The other ranges that meet it (share a byte with it), each with its key (a range's key
+-    /// is its own while it lives), in the order the lookup by address finds them ([`seat`]).
+-    meets: Vec<((u64, u64), ResourceKey)>,
++    /// is its own while it lives) and macbox that key's import, in the order the lookup by
++    /// address finds them ([`seat`]).
++    meets: Vec<((u64, u64), ResourceKey, u64)>,
+ }
+ 
+ impl Placed {
+@@ -539,25 +642,35 @@ impl Placed {
+         self.keys > 1 || !self.first || !self.meets.is_empty()
+     }
+ 
+-    /// The range over `at`, whose key is `key`, meets it from now on.
+-    fn meet(&mut self, at: (u64, u64), key: ResourceKey) {
++    /// The range over `at`, whose key is `key`, in `import`, meets it from now on.
++    fn meet(&mut self, at: (u64, u64), key: ResourceKey, import: u64) {
+         let index = self
+             .meets
+-            .partition_point(|&(other, _)| seat(other) < seat(at));
+-        self.meets.insert(index, (at, key));
++            .partition_point(|&(other, _, _)| seat(other) < seat(at));
++        self.meets.insert(index, (at, key, import));
+     }
+ 
+     /// The range over `at` meets it no longer.
+     fn part(&mut self, at: (u64, u64)) {
+         let index = self
+             .meets
+-            .partition_point(|&(other, _)| seat(other) < seat(at));
+-        if self.meets.get(index).is_some_and(|&(other, _)| other == at) {
++            .partition_point(|&(other, _, _)| seat(other) < seat(at));
++        if self
++            .meets
++            .get(index)
++            .is_some_and(|&(other, _, _)| other == at)
++        {
+             self.meets.remove(index);
+         }
+     }
+ }
+ 
++/// macbox: whether two imports, as placements note them (0: not known), are apart:
++/// either not known, or two.
++fn imports_apart(a: u64, b: u64) -> bool {
++    a == 0 || b == 0 || a != b
++}
++
+ /// Where the lookup by address finds the range over `at` among others ([`Memories::candidates`]):
+ /// by class of length, then by first byte and length.
+ fn seat(at: (u64, u64)) -> (usize, u64, u64) {
+@@ -570,12 +683,13 @@ impl Placements {
+         self.crowded > 0
+     }
+ 
+-    /// Place `key`, lying over no bytes, over `at`.
+-    pub(super) fn place(&mut self, key: ResourceKey, at: (u64, u64)) {
++    /// Place `key`, lying over no bytes, over `at`, in the import `import` names (LOCAL
++    /// (macbox)).
++    pub(super) fn place(&mut self, key: ResourceKey, at: (u64, u64), import: u64) {
+         if at.1 == 0 {
+             return;
+         }
+-        self.at.insert(key, at);
++        self.at.insert(key, (at, import));
+         if let Some(range) = self.ranges.get_mut(at) {
+             let was = range.crowded();
+             range.keys += 1;
+@@ -588,15 +702,16 @@ impl Placements {
+         for other in met {
+             if let Some(range) = self.ranges.get_mut(other) {
+                 let was = range.crowded();
+-                range.meet(at, key);
++                range.meet(at, key, import);
+                 self.crowded += usize::from(!was && range.crowded());
+-                meets.push((other, range.key));
++                meets.push((other, range.key, range.import));
+             }
+         }
+         let range = Placed {
+             key,
+             keys: 1,
+             first: true,
++            import,
+             meets,
+         };
+         self.crowded += usize::from(range.crowded());
+@@ -605,7 +720,7 @@ impl Placements {
+ 
+     /// `key` lies over no bytes from now on.
+     pub(super) fn unplace(&mut self, key: ResourceKey) {
+-        let Some(at) = self.at.remove(&key) else {
++        let Some((at, _)) = self.at.remove(&key) else {
+             return;
+         };
+         let Some(range) = self.ranges.get_mut(at) else {
+@@ -625,7 +740,7 @@ impl Placements {
+         let Some(gone) = self.ranges.remove(at) else {
+             return;
+         };
+-        for (other, _) in gone.meets {
++        for (other, _, _) in gone.meets {
+             if let Some(range) = self.ranges.get_mut(other) {
+                 let was = range.crowded();
+                 range.part(at);
+@@ -634,10 +749,20 @@ impl Placements {
+         }
+     }
+ 
++    /// macbox: whether the placed keys `a` and `b` lie in two imports, or either in one not
++    /// known (the module docs); `false` where either is not placed.
++    pub(super) fn apart(&self, a: ResourceKey, b: ResourceKey) -> bool {
++        match (self.at.get(&a), self.at.get(&b)) {
++            (Some(&(_, a)), Some(&(_, b))) => imports_apart(a, b),
++            _ => false,
++        }
++    }
++
+     /// For a use of `bytes` of `key` (counted from its first byte), each other key those bytes
+     /// share, and the bytes of it they are (counted from its range's first byte), to `each`: its
+     /// own range's key where another, and each other range's the bytes meet, clipped to it, in
+-    /// the order the lookup by address finds them. The ranges the bytes may meet are those that
++    /// the order the lookup by address finds them; macbox: and whether that key lies in
++    /// another import than `key` ([`imports_apart`]). The ranges the bytes may meet are those that
+     /// meet the key's own range, which it keeps: they are read from there while no more than the
+     /// classes of length the lookup by address visits (a range query each, where a kept range is
+     /// a comparison); a use of a range met by more, as one over many others' bytes is, looks up
+@@ -646,9 +771,9 @@ impl Placements {
+         &self,
+         key: ResourceKey,
+         bytes: &std::ops::Range<u64>,
+-        mut each: impl FnMut(ResourceKey, std::ops::Range<u64>),
++        mut each: impl FnMut(ResourceKey, std::ops::Range<u64>, bool),
+     ) {
+-        let Some(&at) = self.at.get(&key) else {
++        let Some(&(at, import)) = self.at.get(&key) else {
+             return;
+         };
+         let Some(own) = self.ranges.get(at) else {
+@@ -658,7 +783,7 @@ impl Placements {
+             return;
+         }
+         if own.key != key {
+-            each(own.key, bytes.clone());
++            each(own.key, bytes.clone(), imports_apart(import, own.import));
+         }
+         if own.meets.is_empty() {
+             return;
+@@ -666,16 +791,20 @@ impl Placements {
+         // The host bytes the use covers, within the key's own.
+         let start = at.0.saturating_add(bytes.start.min(at.1));
+         let end = at.0.saturating_add(bytes.end.min(at.1));
+-        let mut clipped = |other: (u64, u64), key: ResourceKey| {
++        let mut clipped = |other: (u64, u64), key: ResourceKey, theirs: u64| {
+             let from = start.max(other.0);
+             let to = end.min(other.0.saturating_add(other.1));
+             if from < to {
+-                each(key, from - other.0..to - other.0);
++                each(
++                    key,
++                    from - other.0..to - other.0,
++                    imports_apart(import, theirs),
++                );
+             }
+         };
+         if own.meets.len() <= self.ranges.held_classes() {
+-            for &(other, key) in &own.meets {
+-                clipped(other, key);
++            for &(other, key, theirs) in &own.meets {
++                clipped(other, key, theirs);
+             }
+             return;
+         }
+@@ -685,7 +814,7 @@ impl Placements {
+                 continue;
+             }
+             if let Some(range) = self.ranges.get(other) {
+-                clipped(other, range.key);
++                clipped(other, range.key, range.import);
+             }
+         }
+     }
+diff --git a/crates/metal2vulkan-runtime/src/host_rt.rs b/crates/metal2vulkan-runtime/src/host_rt.rs
+index f56f6938..bffcd13f 100644
+--- a/crates/metal2vulkan-runtime/src/host_rt.rs
++++ b/crates/metal2vulkan-runtime/src/host_rt.rs
+@@ -52,11 +52,15 @@
+ //!   pass's `Clear` load of the linear image rounds as ANV's linear clears do, one code from the
+ //!   optimal image's in places (0.1 into `BGRA8Unorm`: 0x19, where the optimal image and Metal
+ //!   write 0x1a; the draws after it blend exactly alike), as upstream's linear images over the
+-//!   runtime's own buffers already do; and a read through a second, separate import of the same
++//!   runtime's own buffers already do. A read through a second, separate import of the same
+ //!   pages (a buffer made after `host_range_remapped`) in the same command buffer as the pass's
+ //!   write read about 2% of its texels stale (`surface_aliases`), where the shadow's merge read
+-//!   none; in another command buffer or on another queue, fresh. Imports of one surface's pages
+-//!   that join (the usual case) read fresh.
++//!   none: the barrier from the pass's color writes to the read left them in the GPU's L3 under
++//!   the first import's GPU address. A use through another import of the same pages now takes
++//!   `MEMORY_WRITE`, so its barriers carry ANV's full flush, and on a driver whose pointer
++//!   imports follow their address a buffer made after a remap lies in the live import instead
++//!   (`host_aliases.rs`): it reads fresh. Imports of one surface's pages that join (the usual
++//!   case) read fresh, with the barrier as it was.
+ //! - **Cost** (`host_rt_frames.rs`, the Arrow Lake iGPU): a pass into a linear image costs far
+ //!   more than into an optimal one (blending 1.5 screens of 3440x1440: 0.66 ms into a `Private`
+ //!   texture, 4.9 ms into a linear image in the device's own memory, 5.4 ms in place over host
+@@ -87,6 +91,22 @@ pub(crate) fn switched() -> bool {
+     crate::live::on(SWITCH, false)
+ }
+ 
++/// Whether the process made a texture that renders or writes in place over host pages (a
++/// device's check's own textures aside).
++static MADE: AtomicBool = AtomicBool::new(false);
++
++/// Note a texture that renders or writes made in place over host pages ([`orders_images`]).
++pub(crate) fn note_made() {
++    MADE.store(true, Ordering::Relaxed);
++}
++
++/// Whether an image's use of a key over host pages takes the uses of the key's bytes
++/// (`host_aliases::augmented`): while the switch is on, and once a texture that renders or
++/// writes was made in place, whose image keeps its form when the switch goes off.
++pub(crate) fn orders_images() -> bool {
++    MADE.load(Ordering::Relaxed) || switched()
++}
++
+ /// The switch `host_rt_max_texels`: where set, a texture of more texels (its width, height and
+ /// depth or layers multiplied) stays a shadow. Rendering into a linear image costs a pass on
+ /// Intel's GPU far more than into an optimal one (the module docs), where the shadow's copies cost
+diff --git a/crates/metal2vulkan-runtime/src/tests/host_aliases.rs b/crates/metal2vulkan-runtime/src/tests/host_aliases.rs
+index fd28d676..db2af089 100644
+--- a/crates/metal2vulkan-runtime/src/tests/host_aliases.rs
++++ b/crates/metal2vulkan-runtime/src/tests/host_aliases.rs
+@@ -147,6 +147,9 @@ fn a_buffer_over_the_bytes_another_covers_lies_in_its_import() {
+ /// The host page of the tests that name none of their own: an import's unit.
+ const PAGE: u64 = 0x1000;
+ 
++/// macbox: the import the tests that name none place every key in: one import.
++const ONE: u64 = 1;
++
+ /// A reported remap counts the ranges placed buffers lie over that have a page among its bytes
+ /// rounded out to the import's unit, with or without memories noted: none for bytes beside
+ /// them, one for a byte of a page one lies on, and none at all with nothing placed.
+@@ -155,11 +158,11 @@ fn a_reported_remap_counts_the_placed_ranges_it_touches() {
+     let aliases = Aliases::default();
+     assert_eq!(aliases.remapped(0, u64::MAX, PAGE), 0, "nothing placed");
+     let (first, second, third) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+-    aliases.place(first, (0x40000, 0x8000));
++    aliases.place(first, (0x40000, 0x8000), ONE);
+     // A second key over the same bytes: one range, one import.
+-    aliases.place(second, (0x40000, 0x8000));
++    aliases.place(second, (0x40000, 0x8000), ONE);
+     // Bytes in the middle of a page past the first range's.
+-    aliases.place(third, (0x50010, 0x20));
++    aliases.place(third, (0x50010, 0x20), ONE);
+     assert_eq!(
+         aliases.remapped(0x30000, 0x40000, PAGE),
+         0,
+@@ -425,9 +428,9 @@ fn keys_over_one_range_share_the_first_placed_there() {
+     let aliases = Aliases::default();
+     let (first, second, third) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+     let surface = (0x7f00_0000_0000, 0x7e_9000);
+-    aliases.place(first, surface);
++    aliases.place(first, surface, ONE);
+     assert_eq!(aliases.augment(&[write(first, 0..0x7e_9000)]), None);
+-    aliases.place(second, surface);
++    aliases.place(second, surface, ONE);
+     assert_eq!(aliases.of(second), None, "joined nothing");
+     let uses = [sample(second, 0..0x7e_9000)];
+     assert_eq!(
+@@ -441,7 +444,7 @@ fn keys_over_one_range_share_the_first_placed_there() {
+         Some(vec![uses[0].clone(), sample(first, 0..0x7e_9000)])
+     );
+     aliases.forget(second);
+-    aliases.place(third, surface);
++    aliases.place(third, surface, ONE);
+     assert_eq!(aliases.augment(&[sample(third, 0..64)]), None);
+ }
+ 
+@@ -452,9 +455,9 @@ fn keys_over_one_range_share_the_first_placed_there() {
+ fn a_use_takes_the_keys_of_the_ranges_its_bytes_meet_clipped() {
+     let aliases = Aliases::default();
+     let (a, b, c) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+-    aliases.place(a, (0x10000, 0x8000));
+-    aliases.place(b, (0x14000, 0x8000));
+-    aliases.place(c, (0x40000, 0x1000));
++    aliases.place(a, (0x10000, 0x8000), ONE);
++    aliases.place(b, (0x14000, 0x8000), ONE);
++    aliases.place(c, (0x40000, 0x1000), ONE);
+     // a's bytes 0x5000..0x7000 lie at 0x15000..0x17000: b's 0x1000..0x3000.
+     let uses = [write(a, 0x5000..0x7000), write(c, 0..64)];
+     assert_eq!(
+@@ -480,7 +483,7 @@ fn a_use_takes_the_keys_of_the_ranges_its_bytes_meet_clipped() {
+     );
+     assert_eq!(aliases.augment(&[write(a, 0..0x1000)]), None);
+     // b rebound beside c: a is on its own, b and c meet.
+-    aliases.place(b, (0x40800, 0x1000));
++    aliases.place(b, (0x40800, 0x1000), ONE);
+     assert_eq!(aliases.augment(&[write(a, 0x5000..0x7000)]), None);
+     assert_eq!(
+         aliases.augment(&[write(c, 0..0x1000)]),
+@@ -500,8 +503,8 @@ fn a_sample_through_a_second_key_waits_for_a_render_through_the_first() {
+     let aliases = Aliases::default();
+     let (rendered, sampled) = (ResourceKey::new(), ResourceKey::new());
+     let surface = (0x7f00_0000_0000, 0x7e_9000);
+-    aliases.place(rendered, surface);
+-    aliases.place(sampled, surface);
++    aliases.place(rendered, surface, ONE);
++    aliases.place(sampled, surface, ONE);
+     let summary = |uses: &[Use<ResourceKey>]| {
+         let mut encoder = EncoderUses::new(true);
+         let uses = aliases.augment(uses).unwrap_or_else(|| uses.to_vec());
+@@ -544,9 +547,9 @@ fn a_use_reads_the_ranges_its_range_keeps_while_few() {
+     let aliases = Aliases::default();
+     let (whole, indices, rects) = (ResourceKey::new(), ResourceKey::new(), ResourceKey::new());
+     // Three classes of length: a page, two pages and three (up to four).
+-    aliases.place(whole, (0x10_0000, 0x3000));
+-    aliases.place(indices, (0x10_0000, 0x1000));
+-    aliases.place(rects, (0x10_1000, 0x2000));
++    aliases.place(whole, (0x10_0000, 0x3000), ONE);
++    aliases.place(indices, (0x10_0000, 0x1000), ONE);
++    aliases.place(rects, (0x10_1000, 0x2000), ONE);
+     let uses = [sample(indices, 0x100..0x200), sample(rects, 0..0x2000)];
+     let carried = vec![
+         uses[0].clone(),
+@@ -570,7 +573,7 @@ fn a_use_reads_the_ranges_its_range_keeps_while_few() {
+     // classes, it looks them up; each quarter page, met by two, reads them.
+     let quarters: Vec<ResourceKey> = (0..4).map(|_| ResourceKey::new()).collect();
+     for (quarter, &key) in (0..4u64).zip(&quarters) {
+-        aliases.place(key, (0x10_0000 + quarter * 0x800, 0x400));
++        aliases.place(key, (0x10_0000 + quarter * 0x800, 0x400), ONE);
+     }
+     assert_eq!(
+         aliases.augment(&[write(whole, 0x1800..0x1c00)]),
+@@ -683,7 +686,7 @@ fn a_use_takes_the_ranges_its_bytes_meet_kept_or_looked_up() {
+                 model_unplace(&mut model, key, at[index].take());
+                 model.entry(place).or_insert((key, 0, true)).1 += 1;
+                 at[index] = Some(place);
+-                aliases.place(key, place);
++                aliases.place(key, place, ONE);
+             }
+             _ => {}
+         }
+@@ -738,12 +741,146 @@ fn the_version_counts_each_change_augment_reads() {
+         assert!(now > last, "{what}");
+         last = now;
+     };
+-    aliases.place(placed, (0x80000, 0x2000));
++    aliases.place(placed, (0x80000, 0x2000), ONE);
+     changed("placed");
+-    aliases.place(placed, (0x90000, 0x2000));
++    aliases.place(placed, (0x90000, 0x2000), ONE);
+     changed("rebound");
+     aliases.unplace(placed);
+     changed("unplaced");
+     aliases.forget(second);
+     changed("forgotten");
+ }
++
++/// macbox: `used` as a use added for a key of another import takes it: `MEMORY_WRITE`
++/// among the access types of its reads and of its writes.
++fn apart(mut used: Use<ResourceKey>) -> Use<ResourceKey> {
++    for side in [&mut used.read, &mut used.write] {
++        if !side.is_empty() {
++            *side = Access::new(side.stages, side.access | vk::AccessFlags2::MEMORY_WRITE);
++        }
++    }
++    used
++}
++
++/// macbox: keys over one surface's pages in two imports (one made after a remap of them):
++/// a use of the second's bytes carries a use of the first's key with `MEMORY_WRITE` among its
++/// access types, where a key in the first's import carries it as it was; a range in a third
++/// import that meets the surface's last page carries the first's key so too, clipped; and a key
++/// of an import not known is apart from every other.
++#[test]
++fn a_use_added_for_a_key_of_another_import_takes_memory_write() {
++    let aliases = Aliases::default();
++    let [first, second, third, beside, unknown] = [(); 5].map(|()| ResourceKey::new());
++    let surface = (0x7f00_0000_0000, 0x7e_9000);
++    aliases.place(first, surface, 1);
++    aliases.place(second, surface, 2);
++    aliases.place(third, surface, 1);
++    let uses = [sample(second, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), apart(sample(first, 0..64))])
++    );
++    let uses = [write(third, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), write(first, 0..64)])
++    );
++    assert_eq!(aliases.augment(&[write(first, 0..64)]), None);
++    let last = surface.0 + surface.1 - PAGE;
++    aliases.place(beside, (last, 2 * PAGE), 3);
++    let uses = [write(beside, 0..PAGE)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![
++            uses[0].clone(),
++            apart(write(first, surface.1 - PAGE..surface.1))
++        ])
++    );
++    aliases.place(unknown, surface, 0);
++    let uses = [write(unknown, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), apart(write(first, 0..64))])
++    );
++    // The first gone, the others still carry its key, as its import.
++    aliases.forget(first);
++    let uses = [write(third, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), write(first, 0..64)])
++    );
++}
++
++/// macbox: two buffers made at once over one memory, each importing it: the second joins
++/// the first's key, and where they are placed in two imports its uses carry the first's key with
++/// `MEMORY_WRITE`; in one import, as they were.
++#[test]
++fn a_joined_buffer_of_another_import_takes_memory_write() {
++    let aliases = Aliases::default();
++    let memory = (0x50000, 0x4000);
++    let [a, b, c] = [(); 3].map(|()| ResourceKey::new());
++    let (one, two) = (Arc::new(1), Arc::new(2));
++    assert_eq!(aliases.join(a, memory, MemoryClass::Shared, &one), None);
++    assert_eq!(
++        aliases.join(b, memory, MemoryClass::Shared, &two),
++        Some(Alias { key: a })
++    );
++    assert_eq!(
++        aliases.join(c, memory, MemoryClass::Shared, &one),
++        Some(Alias { key: a })
++    );
++    aliases.place(a, memory, 1);
++    aliases.place(b, memory, 2);
++    aliases.place(c, memory, 1);
++    let uses = [write(b, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), apart(write(a, 0..64))])
++    );
++    let uses = [write(c, 0..64)];
++    assert_eq!(
++        aliases.augment(&uses),
++        Some(vec![uses[0].clone(), write(a, 0..64)])
++    );
++    drop((one, two));
++}
++
++/// macbox: a remap over a memory each of whose live imports follows its address keeps
++/// it: a later buffer over its bytes lies in its import and joins its key. One whose import does
++/// not, or with no import live, ends.
++#[test]
++fn a_remap_keeps_a_memory_whose_imports_follow_their_address() {
++    let aliases = Aliases::default();
++    let memory = (0x40000, 0x8000);
++    let [first, after, again, gone] = [(); 4].map(|()| ResourceKey::new());
++    let follows = |import: &u32| *import == 7;
++    let import = Arc::new(7);
++    assert_eq!(
++        aliases.join(first, memory, MemoryClass::Shared, &import),
++        None
++    );
++    aliases.remapped_keeping(0x44000, 0x45000, PAGE, follows);
++    assert!(Arc::ptr_eq(
++        &aliases.import(memory, MemoryClass::Shared).unwrap(),
++        &import
++    ));
++    assert_eq!(
++        aliases.join(after, memory, MemoryClass::Shared, &import),
++        Some(Alias { key: first })
++    );
++    // An import that keeps its pages: the memory ends, and the next buffer joins nothing.
++    let kept = Arc::new(8);
++    let other = (0x60000, 0x2000);
++    assert_eq!(aliases.join(again, other, MemoryClass::Shared, &kept), None);
++    aliases.remapped_keeping(0x60000, 0x61000, PAGE, follows);
++    assert!(aliases.import(other, MemoryClass::Shared).is_none());
++    // A memory whose import went ends too.
++    let elsewhere = (0x70000, 0x1000);
++    assert_eq!(join(&aliases, gone, elsewhere), None);
++    aliases.remapped_keeping(0x70000, 0x71000, PAGE, |_| true);
++    assert!(aliases.import(elsewhere, MemoryClass::Shared).is_none());
++    for key in [first, after, again, gone] {
++        aliases.forget(key);
++    }
++    drop((import, kept));
++}
+diff --git a/crates/metal2vulkan-runtime/src/tests/host_import_counts.rs b/crates/metal2vulkan-runtime/src/tests/host_import_counts.rs
+index 8df378c2..aaf61433 100644
+--- a/crates/metal2vulkan-runtime/src/tests/host_import_counts.rs
++++ b/crates/metal2vulkan-runtime/src/tests/host_import_counts.rs
+@@ -22,6 +22,7 @@
+ //! says so and passes.
+ 
+ use super::blit_holds::{device, over_host, until, Host, Scratch, BYTES};
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use crate::{
+     BlitOption, Buffer, CommandBufferStatus, CommandQueue, Device, Error, Origin, ResourceOptions,
+     Size, Texture, TextureDescriptor, WorkCounts,
+@@ -330,9 +331,13 @@ fn a_remap_report_counts_the_live_imports_it_touches_and_imports_count_their_byt
+     device.host_range_remapped(first_byte(&fresh), BYTES as u64);
+     assert_eq!(remaps(&device)[..3], [reported + 2, over + 1, remapped + 1]);
+     // A second buffer over the remapped bytes imports them anew (`host_aliases.rs`): two live
+-    // imports over the same bytes, one placed range, which a report counts once.
++    // imports over the same bytes, one placed range, which a report counts once. macbox:
++    // where the driver's pointer imports follow their address, it lies in the first's import,
++    // which reads the new pages: one import, the same range.
+     let again = over_host(&device, &imported, &runs).unwrap();
+-    assert_eq!(remaps(&device)[3], made + 2);
++    let follows = (device.properties().driver_facts)
++        .live_has(metal2vulkan::device::DriverFact::PointerImportsFollowTheirAddress);
++    assert_eq!(remaps(&device)[3], made + if follows { 1 } else { 2 });
+     device.host_range_remapped(inside, 4096);
+     assert_eq!(remaps(&device)[..3], [reported + 3, over + 2, remapped + 2]);
+     drop((buffer, again));
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 10e313a1..927b65f1 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2226,6 +2226,7 @@ impl Device {
+                                 match made {
+                                     Ok((image, pitched)) => {
+                                         if !checking {
++                                            crate::host_rt::note_made();
+                                             let counts = &self.shared().counts;
+                                             counts.host_texture_in_place(class, pitched);
+                                             if tried.usage.contains(
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/surface_aliases.rs b/crates/metal2vulkan-validation/src/runtime_lane/surface_aliases.rs
+index c453e0b2..bda123a2 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/surface_aliases.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/surface_aliases.rs
+@@ -28,7 +28,12 @@
+ //! the first lived ([`Arrival::AfterRemap`]). Neither joins the first, as joining keeps to the
+ //! memory a buffer was made over; the runtime orders their uses by the bytes each lies over now
+ //! (`host_aliases.rs`'s placements), so their reads are fresh wherever one buffer's would be, two
+-//! queues in submission order included.
++//! queues in submission order included. macbox: the one made after a remap imports the
++//! pages anew, a second `VkDeviceMemory` of them (on a driver whose pointer imports follow their
++//! address it joins the first and lies in its import instead), and its uses through that import
++//! carry `MEMORY_WRITE`, so their barriers flush what a pass wrote through the other: on ANV a
++//! pass's color writes in place (`host_rt_in_place`) read about 2% stale in one command buffer
++//! without it.
+ //!
+ //! The consumer's conversion of a two-plane YCbCr surface reads the second import as a plain
+ //! buffer: the guest writes the surface through a texture over the first import, and the consumer's
+@@ -169,7 +174,8 @@ enum Arrival {
+     /// Made over other pages, then rebound to the surface's: it joins nothing.
+     Rebound,
+     /// Made over them after the program reported their range remapped while the first lived
+-    /// (with no remap made): it joins nothing, and imports them anew.
++    /// (with no remap made): it joins nothing, and imports them anew (macbox: on a driver
++    /// whose pointer imports follow their address it joins the first instead).
+     AfterRemap,
+ }
+ 

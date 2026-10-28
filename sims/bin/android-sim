@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# android-sim: local Android emulators for Expo / React Native apps, for agents.
+# They run on this machine itself (KVM) and cost nothing but its own CPU and memory.
+# Optional part of macbox: it needs the Android SDK (cmdline-tools, emulator, platform-tools,
+# a system image), a JDK 17 for builds, /dev/kvm, and agent-device on PATH. The GPU path also
+# needs sway and Xwayland (see android-gpu-desktop); without them emulators render in software.
+#
+#   android-sim setup         install the system image and create the pool's emulators (once)
+#   android-sim up            start this checkout's emulator (headless) and wait until Android has booted
+#   android-sim run           build this checkout's Expo app (debug), install it, open it, keep Metro running
+#                             MODE=release android-sim run: a Release build, the JavaScript inside, no Metro
+#   android-sim snapshot      accessibility tree of the screen
+#   android-sim ad <args>     any agent-device command, on this checkout's emulator
+#   android-sim shot <png>    save a screenshot
+#   android-sim record <mp4> [s]  record the screen for s seconds (default 5, at most 180), copied here
+#   android-sim serial        this checkout's emulator (emulator-NNNN), for T3 Code's device_open
+#   android-sim logs          the last build, Metro and emulator output
+#   android-sim status        every emulator in the pool: who has it, app, Metro
+#   android-sim env           the Android SDK environment, for your own builds: eval "$(android-sim env)"
+#   android-sim down          stop this checkout's Metro and emulator (--all: every one android-sim runs)
+#
+# There is a pool of emulators (ANDROID_SIM_POOL). Each checkout (git root)
+# gets its own, so agents working in different checkouts or worktrees don't
+# wait for each other. ANDROID_SIM_DEVICE=<avd> picks one explicitly.
+# Settings: ~/.config/macbox/macbox.env (written by `macbox init`); the environment overrides it.
+set -uo pipefail
+
+# macbox's settings. Variables already set in the environment win over the file.
+MACBOX_CONFIG="${MACBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/macbox.env}"
+if [ -r "$MACBOX_CONFIG" ]; then
+  _env=$(declare -px | grep -E '^declare -x (MACBOX_|ANDROID_|GRADLE_USER_HOME=|JAVA_HOME=|MAX_HOURS=)' || true)
+  set -a
+  # shellcheck source=/dev/null
+  . "$MACBOX_CONFIG"
+  set +a
+  eval "$_env"; unset _env
+fi
+
+# Android Studio's default places, unless the config names others (the SDK, the emulators'
+# disks and Gradle's cache each grow to several GB: put them on a big volume if / is small).
+ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+export ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_HOME" ANDROID_AVD_HOME
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$HOME/.gradle}"
+if [ -z "${JAVA_HOME:-}" ]; then
+  for j in /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/java-17-openjdk /usr/lib/jvm/temurin-17-jdk-amd64 /usr/lib/jvm/java-17; do
+    [ -d "$j" ] && { export JAVA_HOME="$j"; break; }
+  done
+fi
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+
+read -r -a POOL <<<"${ANDROID_SIM_POOL:-macbox-pixel-1 macbox-pixel-2 macbox-pixel-3}"
+# What `android-sim setup` creates: the system image and the screen (720x1600 at 280 dpi is
+# a Pixel 9's 411 dp layout width at fewer pixels), cores and memory of each emulator.
+IMAGE="${ANDROID_SIM_IMAGE:-system-images;android-36;google_apis;x86_64}"
+AVD_DEVICE="${ANDROID_SIM_AVD_DEVICE:-medium_phone}"
+AVD_SCREEN="${ANDROID_SIM_SCREEN:-720x1600@280}"
+AVD_CORES="${ANDROID_SIM_CORES:-2}"
+AVD_RAM="${ANDROID_SIM_RAM:-3072M}"
+# The GPU: auto = the hidden GPU desktop if it starts, else software; host; software.
+GPU_MODE="${ANDROID_SIM_GPU:-auto}"
+RENDER_NODE="${MACBOX_RENDER_NODE:-/dev/dri/renderD128}"
+# A forgotten emulator stops by itself after this long.
+MAX_HOURS="${MAX_HOURS:-6}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/android-sim"
+CLAIMS="$STATE_DIR/claims"
+mkdir -p "$CLAIMS"
+
+# Set by select_device: the emulator this command works on.
+AVD="" SERIAL="" METRO_PORT="" DEV_DIR="" EMU_UNIT="" METRO_UNIT="" BUILD_UNIT=""
+
+log() { printf 'android-sim: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+unit_active() { systemctl --user is-active -q "$1"; }
+
+# Runs a command as a transient user service, so it outlives the caller's shell
+# and tool timeouts. Output goes to the given log file.
+start_unit() {
+  local unit="$1" dir="$2" logf="$3" ci="$4"; shift 4
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  : > "$logf"
+  systemd-run --user --unit="$unit" --collect --quiet \
+    -p WorkingDirectory="$dir" \
+    -p StandardOutput="append:$logf" -p StandardError="append:$logf" \
+    --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+    --setenv=ANDROID_HOME="$ANDROID_HOME" --setenv=ANDROID_SDK_ROOT="$ANDROID_HOME" \
+    --setenv=ANDROID_AVD_HOME="$ANDROID_AVD_HOME" --setenv=JAVA_HOME="${JAVA_HOME:-}" \
+    --setenv=GRADLE_USER_HOME="$GRADLE_USER_HOME" --setenv=ANDROID_SERIAL="$SERIAL" \
+    --setenv=CI="$ci" "$@"
+}
+
+# ------------------------------------------------------------------ the pool
+
+# "avd serial" for every running emulator, whoever started it (android-sim or
+# T3 Code's Device panel).
+running() {
+  local s name
+  adb start-server >/dev/null 2>&1
+  for s in $(adb devices 2>/dev/null | awk '$1 ~ /^emulator-[0-9]+$/ && $2 == "device" {print $1}'); do
+    name=$(adb -s "$s" emu avd name 2>/dev/null | head -1 | tr -d '\r')
+    [ -n "$name" ] && printf '%s %s\n' "$name" "$s"
+  done
+}
+
+serial_of() { running | awk -v a="$1" '$1 == a {print $2; exit}'; }
+
+pool_index() {
+  local i
+  for i in "${!POOL[@]}"; do [ "${POOL[$i]}" = "$1" ] && { echo "$i"; return 0; }; done
+  return 1
+}
+
+# Who is using an emulator: the checkout path in its claim file.
+claim_of() { cat "$CLAIMS/$1" 2>/dev/null; }
+
+# A claim counts while its emulator, Metro or build runs, and for 10 minutes
+# after it was made (the emulator may not have started yet).
+claim_live() {
+  [ -s "$CLAIMS/$1" ] || return 1
+  [ $(( $(date +%s) - $(stat -c %Y "$CLAIMS/$1") )) -lt 600 ] && return 0
+  unit_active "android-sim-emulator-$1" || unit_active "android-sim-metro-$1" \
+    || unit_active "android-sim-build-$1" || [ -n "$(serial_of "$1")" ]
+}
+
+# The checkout this command belongs to: its git root, else the current folder.
+owner_key() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+set_device() {
+  local i
+  AVD="$1"
+  i=$(pool_index "$AVD") || die "'$AVD' is not in the pool (${POOL[*]})"
+  METRO_PORT=$((8081 + 2 * i))
+  EMU_UNIT="android-sim-emulator-$AVD"
+  METRO_UNIT="android-sim-metro-$AVD"
+  BUILD_UNIT="android-sim-build-$AVD"
+  DEV_DIR="$STATE_DIR/$AVD"
+  mkdir -p "$DEV_DIR"
+  SERIAL=$(serial_of "$AVD")
+  # Its own agent-device state, apart from the other emulators'.
+  export AGENT_DEVICE_STATE_DIR="$DEV_DIR/agent-device"
+}
+
+# Picks this checkout's emulator, or claims a free one. With claim=0 it only
+# looks (status, logs, down) and fails if the checkout has none.
+select_device() {
+  local claim="${1:-1}" key a
+  key=$(owner_key)
+  if [ -n "${ANDROID_SIM_DEVICE:-}" ]; then
+    a="$ANDROID_SIM_DEVICE"
+    [[ $a == emulator-* ]] && a=$(running | awk -v s="$a" '$2 == s {print $1; exit}')
+    [ -n "$a" ] || die "no running emulator $ANDROID_SIM_DEVICE"
+    set_device "$a"
+    [ "$claim" = 1 ] && printf '%s\n' "$key" > "$CLAIMS/$AVD"
+    return 0
+  fi
+  exec 9>"$STATE_DIR/pool.lock"; flock 9
+  for a in "${POOL[@]}"; do
+    if [ "$(claim_of "$a")" = "$key" ]; then set_device "$a"; flock -u 9; return 0; fi
+  done
+  [ "$claim" = 1 ] || { flock -u 9; die "this checkout ($key) has no emulator; android-sim up"; }
+  # Only an emulator that is off and unclaimed. A running one nobody claims was
+  # opened by the user in T3's Device panel; take it only with ANDROID_SIM_DEVICE.
+  local pick=""
+  for a in "${POOL[@]}"; do
+    claim_live "$a" || [ -n "$(serial_of "$a")" ] || unit_active "android-sim-emulator-$a" || { pick="$a"; break; }
+  done
+  [ -n "$pick" ] || { flock -u 9; die "all ${#POOL[@]} emulators are in use or open in T3: $(cmd_status | tr '\n' ' '). Wait, or use one with ANDROID_SIM_DEVICE=<avd>"; }
+  printf '%s\n' "$key" > "$CLAIMS/$pick"
+  flock -u 9
+  set_device "$pick"
+  log "using $AVD for $key"
+}
+
+booted() {
+  [ -n "$SERIAL" ] && [ "$(adb -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]
+}
+
+# Each pool emulator has its own port (5570, 5572, ...), away from the ports T3
+# Code takes from 5554 up, so two agents starting at once never collide.
+free_port() {
+  local p used i
+  i=$(pool_index "$AVD")
+  used=$(adb devices 2>/dev/null | sed -n 's/^emulator-\([0-9]*\).*/\1/p')
+  for p in $((5570 + 2 * i)) $(seq 5600 2 5682); do
+    grep -qx "$p" <<<"$used" && continue
+    ss -ltn 2>/dev/null | grep -qE "[:.]($p|$((p + 1)))\b" && continue
+    echo "$p"; return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- emulator
+
+# /dev/kvm must be readable and writable: by this user, or through the kvm group
+# (`sg kvm`, for a group membership the login session doesn't have yet).
+KVM_VIA_SG=""
+check_kvm() {
+  [ -r /dev/kvm ] && [ -w /dev/kvm ] && return 0
+  if command -v sg >/dev/null 2>&1 && sg kvm -c 'test -r /dev/kvm && test -w /dev/kvm' 2>/dev/null; then
+    KVM_VIA_SG=1; return 0
+  fi
+  die "no access to /dev/kvm, which the emulator needs (add this user to the kvm group); tell the user"
+}
+
+# The hidden desktop on the GPU (see bin/android-gpu-desktop). Started on demand;
+# true when its X display is there and the GPU is usable.
+GPU_DISPLAY="${ANDROID_GPU_DISPLAY:-20}"
+gpu_desktop() {
+  [ "$GPU_MODE" = software ] && return 1
+  [ -r "$RENDER_NODE" ] && [ -w "$RENDER_NODE" ] || return 1
+  unit_active android-gpu-desktop.service || systemctl --user start android-gpu-desktop.service >/dev/null 2>&1
+  for _ in $(seq 30); do [ -S "/tmp/.X11-unix/X$GPU_DISPLAY" ] && return 0; sleep 0.2; done
+  return 1
+}
+
+cmd_up() {
+  check_kvm
+  [ -d "$ANDROID_AVD_HOME/$AVD.avd" ] || die "the emulator '$AVD' doesn't exist (expected in $ANDROID_AVD_HOME; android-sim setup makes it)"
+  if [ -z "$SERIAL" ] && ! unit_active "$EMU_UNIT"; then
+    local port; port=$(free_port) || die "no free emulator port"
+    SERIAL="emulator-$port"
+    log "starting $AVD on $SERIAL (headless; stops by itself after ${MAX_HOURS}h)"
+    systemctl --user reset-failed "$EMU_UNIT" >/dev/null 2>&1 || true
+    # On the GPU through the hidden GPU desktop (android-gpu-desktop.service,
+    # display :20), else software rendering. Low CPU and IO weight so a booting
+    # emulator doesn't slow down the machine's other services.
+    local gpu=swiftshader_indirect display=""
+    if gpu_desktop; then gpu=host display=":$GPU_DISPLAY"
+    elif [ "$GPU_MODE" = host ]; then die "ANDROID_SIM_GPU=host, but the GPU desktop doesn't start (systemctl --user status android-gpu-desktop)"
+    elif [ "$GPU_MODE" != software ]; then log "the GPU desktop isn't available; rendering in software (slower)"; fi
+    local emu=("$ANDROID_HOME/emulator/emulator" -avd "$AVD" -port "$port"
+      -no-window -no-audio -no-boot-anim -gpu "$gpu" -no-metrics)
+    [ -n "$KVM_VIA_SG" ] && emu=(sg kvm -c "exec $(printf '%q ' "${emu[@]}")")
+    systemd-run --user --unit="$EMU_UNIT" --collect --quiet \
+      -p RuntimeMaxSec=$(( MAX_HOURS * 3600 )) \
+      -p CPUWeight=30 -p IOWeight=30 \
+      -p StandardOutput="file:$DEV_DIR/emulator.log" -p StandardError="append:$DEV_DIR/emulator.log" \
+      --setenv=HOME="$HOME" --setenv=ANDROID_HOME="$ANDROID_HOME" \
+      --setenv=ANDROID_SDK_ROOT="$ANDROID_HOME" --setenv=ANDROID_AVD_HOME="$ANDROID_AVD_HOME" \
+      ${display:+--setenv=DISPLAY="$display"} \
+      "${emu[@]}" || die "could not start the emulator"
+  fi
+  local deadline=$(( $(date +%s) + 300 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ -n "$SERIAL" ] || SERIAL=$(serial_of "$AVD")
+    if booted; then
+      # Wake and unlock the screen, so the first snapshot sees the app, not the lock screen.
+      adb -s "$SERIAL" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+      adb -s "$SERIAL" shell wm dismiss-keyguard >/dev/null 2>&1
+      return 0
+    fi
+    if ! unit_active "$EMU_UNIT" && [ -z "$(serial_of "$AVD")" ]; then
+      log "the emulator stopped while booting:"; tail -20 "$DEV_DIR/emulator.log" >&2; return 1
+    fi
+    sleep 3
+  done
+  log "the emulator did not finish booting in 5 minutes"; return 1
+}
+
+stop_device() {
+  systemctl --user stop "$METRO_UNIT" "$BUILD_UNIT" >/dev/null 2>&1 || true
+  ad close >/dev/null 2>&1 || true
+  if [ -n "$SERIAL" ]; then
+    # A clean shutdown saves the quick-boot snapshot, so the next start is fast.
+    adb -s "$SERIAL" emu kill >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do [ -z "$(serial_of "$AVD")" ] && ! unit_active "$EMU_UNIT" && break; sleep 1; done
+  fi
+  systemctl --user stop "$EMU_UNIT" >/dev/null 2>&1 || true
+  rm -f "$DEV_DIR/app" "$CLAIMS/$AVD"
+  echo "$AVD down"
+}
+
+cmd_down() {
+  if [ "${1:-}" = "--all" ]; then
+    local a
+    # Not the ones the user opened in T3's Device panel (no claim, not ours).
+    for a in "${POOL[@]}"; do
+      set_device "$a"
+      [ -s "$CLAIMS/$a" ] || unit_active "$EMU_UNIT" || continue
+      stop_device
+    done
+  else
+    select_device 0; stop_device
+  fi
+}
+
+# ------------------------------------------------------------------ project
+
+ROOT=""; APPDIR=""
+
+detect_app_dir() {
+  if [ -n "${APP_DIR:-}" ]; then printf '%s' "${APP_DIR%/}"; return 0; fi
+  local cands here d n
+  cands=$(cd "$ROOT" && find . -maxdepth 4 \
+      \( -name node_modules -o -name .git -o -name ios -o -name android \) -prune \
+      -o \( -name app.json -o -name app.config.ts -o -name app.config.js \) -exec dirname {} \; 2>/dev/null \
+    | sort -u \
+    | while read -r d; do
+        grep -q '"expo"[[:space:]]*:' "$d/package.json" 2>/dev/null && printf '%s\n' "${d#./}"
+      done)
+  n=$(printf '%s' "$cands" | grep -c . || true)
+  [ "$n" -gt 0 ] || { log "no Expo app found in $ROOT; set APP_DIR"; return 1; }
+  if [ "$n" -gt 1 ]; then
+    here=$(git rev-parse --show-prefix 2>/dev/null)
+    while read -r d; do
+      [ "$d" != "." ] && case "$here" in "$d"/*) printf '%s' "$d"; return 0 ;; esac
+    done <<<"$cands"
+    log "several Expo apps here; set APP_DIR to one of: $(printf '%s' "$cands" | tr '\n' ' ')"
+    return 1
+  fi
+  printf '%s' "$cands"
+}
+
+# The Android package id: from the app config, else from the generated project.
+package_id() {
+  local dir="$ROOT/$APPDIR" id=""
+  [ -f "$dir/app.json" ] && id=$(jq -r '.expo.android.package // .android.package // empty' "$dir/app.json" 2>/dev/null)
+  if [ -z "$id" ] && [ -f "$dir/android/app/build.gradle" ]; then
+    id=$(sed -n 's/.*applicationId[[:space:]]*["'\'']\([^"'\'']*\)["'\''].*/\1/p' "$dir/android/app/build.gradle" | head -1)
+  fi
+  printf '%s' "$id"
+}
+
+# `expo run:android` generates an android/ folder. Keep it out of `git status`
+# when the project doesn't ignore it already, without changing any tracked file.
+hide_generated() {
+  local rel="${APPDIR%/}/android"; rel="${rel#./}"
+  git -C "$ROOT" check-ignore -q "$rel" 2>/dev/null && return 0
+  git -C "$ROOT" ls-files --error-unmatch "$rel" >/dev/null 2>&1 && return 0   # tracked: a bare project
+  printf '/%s/\n' "$rel" >> "$(git -C "$ROOT" rev-parse --git-path info/exclude)"
+  log "added /$rel/ to .git/info/exclude (local only), so the generated Android project stays out of git status"
+}
+
+restore_package_json() {
+  local pj; pj=$(cat "$DEV_DIR/package.json.path" 2>/dev/null)
+  [ -n "$pj" ] && [ -f "$DEV_DIR/package.json.before" ] || return 0
+  if ! cmp -s "$pj" "$DEV_DIR/package.json.before"; then
+    cp "$DEV_DIR/package.json.before" "$pj"
+    log "put back package.json (expo prebuild had rewritten its scripts)"
+  fi
+  rm -f "$DEV_DIR/package.json.before" "$DEV_DIR/package.json.path"
+}
+
+open_app() {
+  local id; id=$(cat "$DEV_DIR/app" 2>/dev/null)
+  [ -n "$id" ] || return 0
+  ad open "$id" >/dev/null 2>&1 || true
+}
+
+# The app reaches Metro at localhost:8081 on the device; each emulator's 8081
+# goes to its own Metro port on this machine.
+reverse_metro() {
+  adb -s "$SERIAL" reverse tcp:8081 tcp:"$METRO_PORT" >/dev/null 2>&1 || true
+  [ "$METRO_PORT" = 8081 ] || adb -s "$SERIAL" reverse tcp:"$METRO_PORT" tcp:"$METRO_PORT" >/dev/null 2>&1 || true
+}
+
+cmd_run() {
+  ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside the app's git checkout"
+  APPDIR=$(detect_app_dir) || exit 1
+  local dir="$ROOT/$APPDIR" id
+  select_device 1
+  cmd_up || exit 1
+  hide_generated
+
+  if unit_active "$BUILD_UNIT"; then
+    log "a build is already running; waiting for it"
+  elif [ "${MODE:-}" = release ]; then
+    # Release: Gradle bundles the JavaScript into the app; no Metro, no Fast Refresh.
+    systemctl --user stop "$METRO_UNIT" >/dev/null 2>&1 || true
+    log "building $APPDIR for Android on $AVD (Release)"
+    cp "$dir/package.json" "$DEV_DIR/package.json.before" 2>/dev/null || true
+    printf '%s' "$dir/package.json" > "$DEV_DIR/package.json.path"
+    start_unit "$BUILD_UNIT" "$dir" "$DEV_DIR/build.log" 1 \
+      npx expo run:android --variant release --no-bundler --device "$AVD" \
+      || die "could not start the build"
+  else
+    # Metro first, so the debug app finds its bundler the moment it opens.
+    systemctl --user stop "$METRO_UNIT" >/dev/null 2>&1 || true
+    # CI=0: in CI mode Metro doesn't watch files, and Fast Refresh stops working.
+    start_unit "$METRO_UNIT" "$dir" "$DEV_DIR/metro.log" 0 npx expo start --port "$METRO_PORT" \
+      || die "could not start Metro"
+    for _ in $(seq 1 90); do
+      curl -fsS -m 2 "http://127.0.0.1:$METRO_PORT/status" 2>/dev/null | grep -q running && break
+      sleep 2
+    done
+    reverse_metro
+    log "building $APPDIR for Android on $AVD (the first build downloads Gradle and takes several minutes)"
+    # expo prebuild rewrites the "android"/"ios" scripts in package.json; keep a
+    # copy so the project's file can be put back once the build is done.
+    cp "$dir/package.json" "$DEV_DIR/package.json.before" 2>/dev/null || true
+    printf '%s' "$dir/package.json" > "$DEV_DIR/package.json.path"
+    start_unit "$BUILD_UNIT" "$dir" "$DEV_DIR/build.log" 1 \
+      npx expo run:android --no-bundler --device "$AVD" --port "$METRO_PORT" \
+      || die "could not start the build"
+  fi
+
+  local deadline=$(( $(date +%s) + 2400 )) last="" line
+  while unit_active "$BUILD_UNIT"; do
+    [ "$(date +%s)" -lt "$deadline" ] || die "the build is still running after 40 minutes; see android-sim logs"
+    line=$(grep -E '^> Task|BUILD|Installing|Opening|Error' "$DEV_DIR/build.log" 2>/dev/null | tail -1)
+    [ -n "$line" ] && [ "$line" != "$last" ] && { log "$line"; last="$line"; }
+    sleep 15
+  done
+  restore_package_json
+  if ! grep -qE 'BUILD SUCCESSFUL|Installing|Opening' "$DEV_DIR/build.log"; then
+    log "the build failed:"; tail -30 "$DEV_DIR/build.log" >&2; exit 1
+  fi
+  id=$(package_id)
+  [ -n "$id" ] || die "built, but the Android package id wasn't found; set expo.android.package in the app config"
+  printf '%s' "$id" > "$DEV_DIR/app"
+  [ "${MODE:-}" = release ] || reverse_metro
+  adb -s "$SERIAL" shell monkey -p "$id" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+  open_app
+  if [ "${MODE:-}" = release ]; then
+    echo "running $id (Release) on $AVD ($SERIAL)"
+  else
+    echo "running $id on $AVD ($SERIAL), Metro on :$METRO_PORT"
+  fi
+  t3_hint
+}
+
+# In T3 Code, the user sees the emulator once the agent opens it in the Device panel.
+t3_hint() {
+  [ -n "${T3CODE_PROJECT_ROOT:-}${T3CODE_HOME:-}" ] || return 0
+  echo "T3 Code: call device_open with hostId \"local\" and deviceId \"$SERIAL\" so the user sees it in the Device panel"
+}
+
+# ------------------------------------------------------------ setup
+
+# Installs the SDK packages the pool needs and creates each missing emulator. Existing ones
+# are left as they are. sdkmanager asks to accept the SDK licenses the first time.
+cmd_setup() {
+  local a dir cfg w h dpi
+  command -v sdkmanager >/dev/null 2>&1 \
+    || die "no sdkmanager in $ANDROID_HOME/cmdline-tools/latest/bin: install Android's command-line tools there first (https://developer.android.com/studio#command-line-tools-only)"
+  log "installing platform-tools, emulator and $IMAGE (several GB the first time)"
+  if [ -t 0 ]; then sdkmanager --install platform-tools emulator "$IMAGE" || die "sdkmanager failed"
+  else sdkmanager --install platform-tools emulator "$IMAGE" </dev/null \
+         || die "sdkmanager failed; if it asked about licenses, run 'sdkmanager --licenses' in a terminal first"; fi
+  mkdir -p "$ANDROID_AVD_HOME"
+  w=${AVD_SCREEN%%x*}; h=${AVD_SCREEN#*x}; h=${h%@*}; dpi=${AVD_SCREEN#*@}
+  for a in "${POOL[@]}"; do
+    dir="$ANDROID_AVD_HOME/$a.avd"
+    if [ -d "$dir" ]; then log "$a exists; left as it is"; continue; fi
+    echo no | avdmanager create avd -n "$a" -k "$IMAGE" -d "$AVD_DEVICE" -p "$dir" >/dev/null \
+      || die "avdmanager could not create $a"
+    cfg="$dir/config.ini"
+    # The screen, cores and memory above; no Play Store; quick boot from a snapshot.
+    for kv in "hw.lcd.width=$w" "hw.lcd.height=$h" "hw.lcd.density=$dpi" "hw.cpu.ncore=$AVD_CORES" \
+              "hw.ramSize=$AVD_RAM" "PlayStore.enabled=no" "hw.keyboard=no" "fastboot.forceFastBoot=yes" \
+              "showDeviceFrame=no"; do
+      if grep -q "^${kv%%=*}=" "$cfg"; then sed -i "s|^${kv%%=*}=.*|$kv|" "$cfg"; else echo "$kv" >> "$cfg"; fi
+    done
+    # T3 Code (and Android Studio) list the emulators in ~/.android/avd: a pointer file
+    # there when they live elsewhere.
+    if [ "$(readlink -f "$ANDROID_AVD_HOME")" != "$(readlink -f "$HOME/.android/avd")" ]; then
+      mkdir -p "$HOME/.android/avd"
+      printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=%s\n' "$dir" "$(sed -n 's/^target=//p' "$cfg")" > "$HOME/.android/avd/$a.ini"
+    fi
+    log "created $a (${w}x${h} at ${dpi} dpi, $AVD_CORES cores, $AVD_RAM)"
+  done
+  command -v agent-device >/dev/null 2>&1 || log "agent-device isn't on PATH; install it (npm install -g agent-device) so android-sim can read and drive the screen"
+  echo "ready: android-sim status"
+}
+
+# ------------------------------------------------------------ agent-device
+
+ad() {
+  command -v agent-device >/dev/null 2>&1 || { log "agent-device is not installed"; return 127; }
+  agent-device "$@" --platform android --serial "$SERIAL" --session "android-sim-$AVD"
+}
+
+ensure_ready() {
+  select_device 1
+  booted || { cmd_up || exit 1; open_app; }
+}
+
+run_ad() {
+  local out rc
+  out=$(ad "$@" 2>&1); rc=$?
+  if [ $rc -ne 0 ] && grep -qiE 'no active session|SESSION_NOT_FOUND|not connected|No device' <<<"$out"; then
+    open_app
+    [ -s "$DEV_DIR/app" ] || ad open com.android.settings >/dev/null 2>&1
+    out=$(ad "$@" 2>&1); rc=$?
+  fi
+  printf '%s\n' "$out"; return $rc
+}
+
+cmd_status() {
+  local a s c line
+  for a in "${POOL[@]}"; do
+    set_device "$a"; s="$SERIAL"; c=$(claim_of "$a")
+    if [ -n "$s" ]; then
+      booted && line="$a: up ($s)" || line="$a: booting ($s)"
+    elif unit_active "$EMU_UNIT"; then line="$a: booting"
+    else line="$a: off"; fi
+    [ -n "$c" ] && claim_live "$a" && line+=", used by $c"
+    [ -s "$DEV_DIR/app" ] && line+=", app $(cat "$DEV_DIR/app")"
+    unit_active "$BUILD_UNIT" && line+=", build running"
+    unit_active "$METRO_UNIT" && line+=", Metro on :$METRO_PORT"
+    echo "$line"
+  done
+}
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  setup)    cmd_setup ;;
+  up)       select_device 1; cmd_up && { echo "up: $AVD ($SERIAL)"; t3_hint; } ;;
+  run)      cmd_run ;;
+  # The full tree: on Android the interactive filter (-i) drops plain text.
+  snapshot) ensure_ready; run_ad snapshot ;;
+  ad)       ensure_ready; run_ad "$@" ;;
+  shot)
+    [ -n "${1:-}" ] || die "usage: android-sim shot <path.png>"
+    ensure_ready; mkdir -p "$(dirname "$1")"; run_ad screenshot "$1" ;;
+  record)
+    [ -n "${1:-}" ] || die "usage: android-sim record <path.mp4> [seconds]"
+    secs="${2:-5}"; [[ "$secs" =~ ^[0-9]+$ ]] && [ "$secs" -ge 1 ] && [ "$secs" -le 180 ] || die "seconds: 1 to 180"
+    ensure_ready; mkdir -p "$(dirname "$1")"
+    tmp="/sdcard/android-sim-rec-$$.mp4"
+    adb -s "$SERIAL" shell screenrecord --time-limit "$secs" --bit-rate 20000000 "$tmp" \
+      && adb -s "$SERIAL" pull "$tmp" "$1" >/dev/null; rc=$?
+    adb -s "$SERIAL" shell rm -f "$tmp" >/dev/null 2>&1
+    [ $rc -eq 0 ] && echo "$1" || die "recording failed" ;;
+  serial)   select_device 0; [ -n "$SERIAL" ] || die "$AVD is not running; android-sim up"; echo "$SERIAL" ;;
+  logs)
+    select_device 0
+    for f in build metro emulator; do
+      [ -s "$DEV_DIR/$f.log" ] && { echo "== $AVD $f"; tail -40 "$DEV_DIR/$f.log"; }
+    done ;;
+  status)   cmd_status ;;
+  env)
+    printf 'export ANDROID_HOME=%q ANDROID_SDK_ROOT=%q ANDROID_AVD_HOME=%q\n' "$ANDROID_HOME" "$ANDROID_HOME" "$ANDROID_AVD_HOME"
+    [ -n "${JAVA_HOME:-}" ] && printf 'export JAVA_HOME=%q\n' "$JAVA_HOME"
+    printf 'export GRADLE_USER_HOME=%q\n' "$GRADLE_USER_HOME"
+    printf 'export PATH=%q:%q:%q:"$PATH"\n' "$ANDROID_HOME/platform-tools" "$ANDROID_HOME/emulator" "$ANDROID_HOME/cmdline-tools/latest/bin" ;;
+  down)     cmd_down "${1:-}" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

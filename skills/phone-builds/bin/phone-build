@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# phone-build: builds of an Expo app for a real phone (iOS .ipa, Android .apk/.aab), with EAS.
+# The month's free EAS cloud builds go first; once they're used up, the build runs on this
+# machine: Android here, iOS on macbox's macOS VM (eas build --local). Both use the same
+# eas.json profiles and the same EAS-managed signing.
+#
+#   phone-build quota                       free cloud builds left this month, for the project's Expo account
+#   phone-build ios|android [profile]       build it (default profile: preview): in the cloud while free builds
+#                                           are left, else locally. --cloud / --local forces one; --no-wait
+#                                           returns at once with the cloud build's page
+#   phone-build submit ios|android [file]   upload to TestFlight / Google Play: a local file, or the latest cloud build
+#   phone-build device                      register an iPhone for internal builds (prints a link to open on the phone)
+#   phone-build init                        link the app to EAS and write eas.json (development, preview, production)
+#   phone-build setup ios                   the user, once, in a terminal: Apple sign-in, so EAS makes the signing
+#   phone-build doctor                      what's ready and what's missing
+#
+# Local builds land in $PHONE_BUILD_OUT/<checkout>/ (default $TMPDIR/phone-build). Needs eas-cli
+# here (npm install -g eas-cli; signed in with `eas login`), and for local iOS builds eas-cli
+# and fastlane on the Mac plus an Expo access token (below).
+# Settings: ~/.config/macbox/macbox.env (written by `macbox init`); the environment overrides it.
+set -uo pipefail
+
+MACBOX_CONFIG="${MACBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/macbox.env}"
+if [ -r "$MACBOX_CONFIG" ]; then
+  _env=$(declare -px | grep -E '^declare -x (MACBOX_|PHONE_BUILD_|ANDROID_|GRADLE_USER_HOME=|JAVA_HOME=)' || true)
+  set -a
+  # shellcheck source=/dev/null
+  . "$MACBOX_CONFIG"
+  set +a
+  eval "$_env"; unset _env
+fi
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+MAC="${PHONE_BUILD_MAC:-${MACBOX_SSH_HOST:-macbox}}"
+MAC_PATH='$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.macbox/bin:$HOME/.local/portable-ruby/current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+OUT_BASE="${PHONE_BUILD_OUT:-${TMPDIR:-/tmp}/phone-build}"
+# The Expo access token for builds on the Mac: EXPO_TOKEN in the environment, or a line
+# EXPO_TOKEN=... in this file (mode 600). Never in a repo, a script or a command line.
+TOKEN_FILE="${PHONE_BUILD_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/expo.env}"
+
+log() { printf 'phone-build: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2; }
+
+# ------------------------------------------------------------ the app
+
+find_app() {
+  ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside the app's git checkout"
+  if [ -n "${APP_DIR:-}" ]; then APPDIR=$(cd "$ROOT" && realpath -m --relative-to="$ROOT" "$APP_DIR"); return; fi
+  if ls app.json app.config.ts app.config.js >/dev/null 2>&1; then APPDIR=$(realpath --relative-to="$ROOT" .); return; fi
+  local found
+  found=$(cd "$ROOT" && find . -maxdepth 4 \( -name node_modules -o -name .git -o -name ios -o -name android \) -prune \
+    -o \( -name app.json -o -name app.config.ts -o -name app.config.js \) -exec dirname {} \; 2>/dev/null | sort -u)
+  [ -n "$found" ] || die "no app.json or app.config.* in this checkout"
+  [ "$(wc -l <<<"$found")" -eq 1 ] || die "several Expo apps here; cd into one or set APP_DIR: $(tr '\n' ' ' <<<"$found")"
+  APPDIR="${found#./}"
+}
+app_path() { printf '%s/%s' "$ROOT" "${APPDIR#.}"; }
+checkout_key() { printf '%s-%s' "$(basename "$ROOT" | tr -c 'A-Za-z0-9._\n-' '-')" "$(printf '%s' "$ROOT" | sha1sum | cut -c1-6)"; }
+
+# The Expo account that owns the project: app config "owner", else the signed-in user.
+account() {
+  local o
+  o=$(cd "$(app_path)" && npx --no-install expo config --json --type public 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("owner") or "")' 2>/dev/null)
+  [ -n "$o" ] || o=$(eas whoami 2>/dev/null | head -1)
+  [ -n "$o" ] || die "not signed in to Expo here (eas whoami); the user runs 'eas login' once"
+  printf '%s' "$o"
+}
+
+# "used limit" of this month's free cloud builds for a platform.
+quota_of() {  # quota_of <account> <ios|android>
+  eas account:usage "$1" --json --non-interactive 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["builds"][sys.argv[1]]["plan"]
+print(d["used"], d["limit"])' "$2"
+}
+
+# ------------------------------------------------------------ building
+
+out_dir() { local d="$OUT_BASE/$(checkout_key)"; mkdir -p "$d"; printf '%s' "$d"; }
+artifact_name() {  # artifact_name <platform> <profile> -> file name for the local build
+  local ext
+  if [ "$1" = ios ]; then ext=ipa
+  else
+    ext=$(python3 - "$(app_path)/eas.json" "$2" <<'EOF'
+import json, sys
+p = json.load(open(sys.argv[1])).get("build", {}).get(sys.argv[2], {})
+a = p.get("android", {})
+print("apk" if a.get("buildType") == "apk" or p.get("developmentClient") or p.get("distribution") == "internal" else "aab")
+EOF
+)
+  fi
+  printf '%s-%s-%s.%s' "$(basename "$(app_path)")" "$2" "$(date +%Y%m%d-%H%M%S)" "$ext"
+}
+
+expo_token() {
+  [ -n "${EXPO_TOKEN:-}" ] && { printf '%s' "$EXPO_TOKEN"; return; }
+  sed -n 's/^EXPO_TOKEN=//p' "$TOKEN_FILE" 2>/dev/null
+}
+
+build_cloud() {  # build_cloud <platform> <profile> [--no-wait]
+  log "building $1 ($2) in the EAS cloud, free low-priority queue (a wait of an hour or more is possible at peak times)"
+  (cd "$(app_path)" && eas build -p "$1" --profile "$2" --non-interactive ${3:-})
+}
+
+build_local_android() {  # build_local_android <profile>
+  local out; out="$(out_dir)/$(artifact_name android "$1")"
+  eval "$(android-sim env)"
+  log "building android ($1) here: $out"
+  (cd "$(app_path)" && eas build -p android --profile "$1" --local --non-interactive --output "$out") || die "the local Android build failed"
+  echo "$out"
+}
+
+build_local_ios() {  # build_local_ios <profile>
+  local token key src rel name out
+  token=$(expo_token)
+  [ -n "$token" ] || die "an Expo access token is needed for builds on the Mac: the user creates one at https://expo.dev/settings/access-tokens and stores it as a line EXPO_TOKEN=... in $TOKEN_FILE (chmod 600) themselves"
+  key=$(checkout_key); src=".phone-build/src/$key"; rel="${APPDIR#.}"; rel="${rel#/}"
+  name=$(artifact_name ios "$1"); out="$(out_dir)/$name"
+  log "copying $ROOT to the Mac"
+  ssh -o ConnectTimeout=5 "$MAC" "mkdir -p $src .phone-build/out" || die "the Mac doesn't answer (macbox status)"
+  rsync -a --delete --exclude node_modules --exclude .git --exclude .expo --exclude .mac-sim --exclude .phone-build \
+    --exclude "${rel:+$rel/}ios/" --exclude "${rel:+$rel/}android/" "$ROOT/" "$MAC:$src/" || die "copying the checkout to the Mac failed"
+  log "building ios ($1) on the Mac with eas build --local (10 to 30 minutes)"
+  # The token goes over stdin, never on a command line.
+  printf '%s\n' "$token" | ssh "$MAC" "export PATH=\"$MAC_PATH\"; read -r EXPO_TOKEN; export EXPO_TOKEN EAS_NO_VCS=1;
+    cd $src/${rel:-.} && eas build -p ios --profile $(printf %q "$1") --local --non-interactive --output \$HOME/.phone-build/out/$name" \
+    || die "the local iOS build failed (its log is above)"
+  scp -q "$MAC:.phone-build/out/$name" "$out" && ssh "$MAC" "rm -f .phone-build/out/$name" || die "built, but copying the .ipa back failed"
+  echo "$out"
+}
+
+cmd_build() {  # cmd_build <ios|android> [profile] [--cloud|--local] [--no-wait]
+  local platform="$1" profile=preview mode="${PHONE_BUILD_MODE:-auto}" wait="" a q used limit
+  shift
+  for x in "$@"; do
+    case "$x" in
+      --cloud) mode=cloud ;; --local) mode=local ;; --no-wait) wait=--no-wait ;;
+      -*) die "unknown option $x" ;;
+      *) profile="$x" ;;
+    esac
+  done
+  find_app
+  [ -f "$(app_path)/eas.json" ] || die "no eas.json in $APPDIR; run 'phone-build init' first"
+  python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1])).get("build",{}) else 1)' \
+    "$(app_path)/eas.json" "$profile" || die "eas.json has no build profile '$profile'"
+  if [ "$mode" = auto ]; then
+    a=$(account); q=$(quota_of "$a" "$platform")
+    if [ -z "$q" ]; then
+      log "couldn't read $a's free builds; building locally"; mode=local
+    else
+      read -r used limit <<<"$q"
+      if [ "$used" -lt "$limit" ]; then
+        log "$used of $limit free $platform cloud builds used this month by $a: building in the cloud"; mode=cloud
+      else
+        log "the free $platform cloud builds are used up ($used of $limit): building locally"; mode=local
+      fi
+    fi
+  fi
+  if [ "$mode" = cloud ]; then build_cloud "$platform" "$profile" "$wait"
+  elif [ "$platform" = ios ]; then build_local_ios "$profile"
+  else build_local_android "$profile"; fi
+}
+
+# ------------------------------------------------------------ the rest
+
+cmd_quota() {
+  find_app; local a q; a=$(account)
+  for p in ios android; do
+    q=$(quota_of "$a" "$p"); [ -n "$q" ] || die "couldn't read the usage of $a (eas account:usage $a)"
+    read -r used limit <<<"$q"; echo "$p: $used of $limit free cloud builds used this month ($a)"
+  done
+}
+
+cmd_submit() {  # cmd_submit <ios|android> [file]
+  local platform="$1" file="${2:-}"
+  find_app
+  if [ -n "$file" ]; then
+    file=$(realpath "$file"); [ -f "$file" ] || die "no file $file"
+    (cd "$(app_path)" && eas submit -p "$platform" --path "$file" --non-interactive)
+  else
+    (cd "$(app_path)" && eas submit -p "$platform" --latest --non-interactive)
+  fi
+}
+
+cmd_init() {
+  find_app
+  cd "$(app_path)" || exit 1
+  if ! npx --no-install expo config --json --type public 2>/dev/null | grep -q '"projectId"'; then
+    eas init --non-interactive --force || die "eas init failed"
+  fi
+  if [ ! -f eas.json ]; then
+    cat > eas.json <<'EOF'
+{
+  "cli": { "appVersionSource": "remote" },
+  "build": {
+    "development": { "developmentClient": true, "distribution": "internal" },
+    "preview": { "distribution": "internal", "android": { "buildType": "apk" } },
+    "production": { "autoIncrement": true }
+  },
+  "submit": { "production": {} }
+}
+EOF
+    log "wrote eas.json (development, preview, production); commit it"
+  fi
+  echo "ready: phone-build ios|android [development|preview|production]"
+}
+
+cmd_doctor() {
+  local ok=1 a q t
+  find_app; echo "app: $APPDIR in $ROOT"
+  a=$(account); echo "Expo account: $a (signed in here as $(eas whoami 2>/dev/null | head -1))"
+  for p in ios android; do q=$(quota_of "$a" "$p"); echo "free $p cloud builds: ${q:-?} (used limit)"; done
+  if [ -f "$(app_path)/eas.json" ]; then echo "eas.json profiles: $(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1])).get("build",{})))' "$(app_path)/eas.json")"
+  else echo "eas.json: missing (phone-build init)"; ok=0; fi
+  t=$(ssh -o ConnectTimeout=5 "$MAC" "export PATH=\"$MAC_PATH\"; printf 'eas %s, fastlane %s, pod %s, %s' \"\$(eas --version 2>/dev/null | tail -1 | cut -d' ' -f1)\" \"\$(fastlane --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | tail -1)\" \"\$(pod --version 2>/dev/null)\" \"\$(xcodebuild -version 2>/dev/null | head -1)\"" 2>/dev/null)
+  echo "Mac: ${t:-not reachable (macbox status)}"
+  [ -n "$(expo_token)" ] && echo "Expo token for Mac builds: stored" || { echo "Expo token for Mac builds: missing (EXPO_TOKEN=... in $TOKEN_FILE, mode 600)"; ok=0; }
+  echo "Apple signing: made by EAS after the user's one-time 'phone-build setup ios' (needs the paid Apple Developer Program)"
+  [ $ok = 1 ]
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  ios|android) cmd_build "$cmd" "$@" ;;
+  quota)  cmd_quota ;;
+  submit) [ -n "${1:-}" ] || die "usage: phone-build submit ios|android [file]"; cmd_submit "$@" ;;
+  device) find_app; cd "$(app_path)" && eas device:create ;;
+  init)   cmd_init ;;
+  setup)
+    [ "${1:-}" = ios ] || die "usage: phone-build setup ios"
+    [ -t 0 ] || die "run it in a terminal: it asks for the Apple ID, its password and the 2FA code"
+    find_app; cd "$(app_path)" && eas credentials -p ios ;;
+  doctor) cmd_doctor ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

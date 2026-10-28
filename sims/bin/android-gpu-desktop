@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# android-gpu-desktop: a hidden desktop on this machine's GPU, for the Android emulators.
+# A headless sway rendering on the GPU's render node (MACBOX_RENDER_NODE, /dev/dri/renderD128)
+# and a rootless Xwayland on the fixed display :20 (ANDROID_GPU_DISPLAY). Emulators started
+# with DISPLAY=:20 -gpu host render on the GPU instead of the CPU: the emulator's -gpu host
+# needs an X display even with -no-window, and falls back to software without one. About 5x
+# less CPU while the screen moves (measured on an Intel Arrow Lake iGPU). Never touches a
+# monitor. Needs sway and Xwayland (Debian/Ubuntu: apt install sway xwayland) and read-write
+# access to the render node. Run by android-gpu-desktop.service.
+set -euo pipefail
+MACBOX_CONFIG="${MACBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/macbox.env}"
+if [ -r "$MACBOX_CONFIG" ]; then
+  _env=$(declare -px | grep -E '^declare -x (MACBOX_|ANDROID_)' || true)
+  set -a
+  # shellcheck source=/dev/null
+  . "$MACBOX_CONFIG"
+  set +a
+  eval "$_env"; unset _env
+fi
+DISPLAY_NUM="${ANDROID_GPU_DISPLAY:-20}"
+RENDER_NODE="${MACBOX_RENDER_NODE:-/dev/dri/renderD128}"
+command -v sway >/dev/null && command -v Xwayland >/dev/null \
+  || { echo "android-gpu-desktop: needs sway and Xwayland" >&2; exit 1; }
+RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/android-gpu"
+mkdir -p "$RT" && chmod 700 "$RT" && rm -f "$RT"/wayland-*
+printf 'output HEADLESS-1 resolution 800x600 scale 1\nxwayland disable\n' > "$RT/sway.conf"
+export XDG_RUNTIME_DIR="$RT" WLR_BACKENDS=headless WLR_RENDERER=gles2 \
+  WLR_RENDER_DRM_DEVICE="$RENDER_NODE" WLR_LIBINPUT_NO_DEVICES=1
+sway -c "$RT/sway.conf" > "$RT/sway.log" 2>&1 & sway=$!
+for _ in $(seq 100); do ls "$RT"/wayland-? >/dev/null 2>&1 && break; sleep 0.1; done
+export WAYLAND_DISPLAY="$(basename "$(ls "$RT"/wayland-? | head -1)")"
+Xwayland ":$DISPLAY_NUM" -rootless -noreset > "$RT/xwayland.log" 2>&1 & xw=$!
+trap 'kill $xw $sway 2>/dev/null; exit 0' TERM INT
+wait -n $sway $xw; rc=$?
+kill $xw $sway 2>/dev/null; exit $rc

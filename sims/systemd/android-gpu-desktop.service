@@ -1,0 +1,11 @@
+[Unit]
+Description=Hidden desktop on the GPU for the Android emulators (headless sway + Xwayland :20)
+
+[Service]
+ExecStart=%h/.local/bin/android-gpu-desktop
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,378 @@
+From 01eeb65c8a9a24ee722f693bab9eef66b917373f Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 16:46:17 +0200
+Subject: [PATCH] :new: Let a VM's settings turn video acceleration off
+
+A user asked to be able to turn off the VideoToolbox and M2 scaler devices
+that 054ac2080 gave every VM on reims-vgpu, the host's hardware video decode,
+encode and scaling for the guest.
+
+A VM's settings gain video_acceleration, on unless they say off, so every
+existing vm.toml loads and saves as before. Off, the VM has neither device,
+on x86-64 and arm64 alike, and the guest decodes, encodes and scales video in
+software; the command line is then the one every VM ran before 054ac2080. On,
+it is unchanged. The edit form has a Video acceleration toggle, hidden on
+VMware SVGA, which has neither device either way; `set` takes
+--video-acceleration[=false], and `show` gives its state. The OpenCore image
+is unchanged: with the devices off, its video kexts match nothing.
+
+(cherry picked from commit f6b7e92720b886707b3a97f2c695dd066868adae)
+---
+ crates/reims-ctl/src/cli.rs    | 18 +++++++++
+ crates/reims-ctl/src/create.rs |  1 +
+ crates/reims-ctl/src/qemu.rs   | 61 +++++++++++++++++++++++------
+ crates/reims-ctl/src/tui.rs    | 70 +++++++++++++++++++++++++++++++---
+ crates/reims-ctl/src/vm.rs     | 30 +++++++++++++++
+ docs/qemu.md                   |  6 ++-
+ 6 files changed, 166 insertions(+), 20 deletions(-)
+
+diff --git a/crates/reims-ctl/src/cli.rs b/crates/reims-ctl/src/cli.rs
+index b3e414e..1942034 100644
+--- a/crates/reims-ctl/src/cli.rs
++++ b/crates/reims-ctl/src/cli.rs
+@@ -337,6 +337,10 @@ pub struct SetArgs {
+     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
+     #[arg(long)]
+     pub gpu: Option<String>,
++    /// On reims-vgpu: the host's hardware video decode, encode and scaling for the guest. Off,
++    /// the guest does them in software
++    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
++    pub video_acceleration: Option<bool>,
+     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+     pub logs: Option<bool>,
+     /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_core=debug
+@@ -857,6 +861,17 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
+             },
+         );
+     }
++    if c.graphics == vm::Graphics::ReimsVgpu {
++        add(
++            "video",
++            if c.video_acceleration {
++                "on (the host's hardware)"
++            } else {
++                "off (the guest's software)"
++            }
++            .into(),
++        );
++    }
+     if let Some(q) = &c.q35 {
+         add("opencore", paths::tilde(&vm.path(&q.opencore)));
+         add(
+@@ -1036,6 +1051,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
+     if let Some(g) = &a.gpu {
+         c.gpu = resolve_gpu(g)?;
+     }
++    if let Some(b) = a.video_acceleration {
++        c.video_acceleration = b;
++    }
+     if let Some(b) = a.logs {
+         c.logs.enabled = b;
+     }
+diff --git a/crates/reims-ctl/src/create.rs b/crates/reims-ctl/src/create.rs
+index 1326c6d..4c42384 100644
+--- a/crates/reims-ctl/src/create.rs
++++ b/crates/reims-ctl/src/create.rs
+@@ -291,6 +291,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
+         stop_timeout_secs: 90,
+         extra_args: vec![],
+         graphics: Graphics::ReimsVgpu,
++        video_acceleration: true,
+         display: spec.display.clone(),
+         gpu: spec.gpu.clone(),
+         audio: Audio {
+diff --git a/crates/reims-ctl/src/qemu.rs b/crates/reims-ctl/src/qemu.rs
+index 08e0d7c..8dc4958 100644
+--- a/crates/reims-ctl/src/qemu.rs
++++ b/crates/reims-ctl/src/qemu.rs
+@@ -57,6 +57,8 @@
+ //! mapper driver, so an x86-64 VM has the devices at slots 8 and 9, after its mapper, and one on
+ //! `vmware-svga`, which has no mapper, has neither. A guest without the drivers leaves both
+ //! devices without one (docs/qemu.md, "The VideoToolbox device" and "The M2 scaler device").
++//! A VM whose settings turn video acceleration off (`video_acceleration = false`) has neither,
++//! and its guest decodes, encodes and scales video in software.
+ //!
+ //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
+ 
+@@ -299,12 +301,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
+             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
+         ]);
+         // The video devices, whose guest drivers link the mapper's (the module doc).
+-        push(&[
+-            "-device",
+-            "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+-            "-device",
+-            "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+-        ]);
++        if c.video_acceleration {
++            push(&[
++                "-device",
++                "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
++                "-device",
++                "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
++            ]);
++        }
+     }
+     push(&[
+         "-device",
+@@ -378,12 +382,14 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
+         &format!("apple-gfx-mmio.resolution={}", c.display.qemu_resolution()?),
+     ]);
+     // The video devices, whose guest drivers arm64 macOS ships (the module doc).
+-    push(&[
+-        "-device",
+-        "apple-videotoolbox-pci,id=video",
+-        "-device",
+-        "apple-m2scaler-pci,id=scaler",
+-    ]);
++    if c.video_acceleration {
++        push(&[
++            "-device",
++            "apple-videotoolbox-pci,id=video",
++            "-device",
++            "apple-m2scaler-pci,id=scaler",
++        ]);
++    }
+     if c.audio.enabled {
+         push(&["-audiodev", &audiodev(vm, ctx)]);
+         push(&["-device", "virtio-sound-pci,id=audio,audiodev=snd0"]);
+@@ -530,6 +536,7 @@ mod tests {
+                 stop_timeout_secs: 90,
+                 extra_args: vec![],
+                 graphics: Graphics::ReimsVgpu,
++                video_acceleration: true,
+                 display: Display::default(),
+                 gpu: Gpu::default(),
+                 audio: Audio::default(),
+@@ -736,6 +743,36 @@ mod tests {
+         assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
+     }
+ 
++    /// With video acceleration off, a VM's command line is the one with it on less the two video
++    /// devices, on q35 and on vmapple.
++    #[test]
++    fn video_acceleration_off_leaves_out_both_video_devices() {
++        let mut vmapple = q35_vm();
++        vmapple.config.profile = Profile::VmappleArm64;
++        vmapple.config.q35 = None;
++        vmapple.config.vmapple = Some(Vmapple {
++            aux: "aux.img".into(),
++            ecid: 1234,
++        });
++        for (vm, host) in [(q35_vm(), linux()), (vmapple, mac())] {
++            let mut on = invocation(&vm, &ctx(host)).unwrap().args;
++            let i = on
++                .iter()
++                .position(|x| x.starts_with("apple-videotoolbox-pci,"))
++                .unwrap();
++            assert!(
++                on[i - 1] == "-device"
++                    && on[i + 1] == "-device"
++                    && on[i + 2].starts_with("apple-m2scaler-pci,"),
++                "{on:?}"
++            );
++            on.drain(i - 1..i + 3);
++            let mut off = vm.clone();
++            off.config.video_acceleration = false;
++            assert_eq!(invocation(&off, &ctx(host)).unwrap().args, on);
++        }
++    }
++
+     /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.
+     #[test]
+     fn a_disk_on_nvme_has_a_controller_of_its_own() {
+diff --git a/crates/reims-ctl/src/tui.rs b/crates/reims-ctl/src/tui.rs
+index 0385757..5785e5d 100644
+--- a/crates/reims-ctl/src/tui.rs
++++ b/crates/reims-ctl/src/tui.rs
+@@ -1442,7 +1442,8 @@ impl App {
+             ),
+             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
+         ];
+-        // The displays' and the GPU's fields are reims-vgpu's; an arm64 VM has no other.
++        // The displays', the GPU's and video acceleration's fields are reims-vgpu's; an arm64 VM
++        // has no other.
+         let library = &["reims-vgpu"];
+         if c.profile == Profile::Q35X86_64 {
+             let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
+@@ -1493,6 +1494,14 @@ impl App {
+             fields.push(self.gpu_field(&c.gpu).show_if("graphics", library));
+         }
+         fields.extend([
++            Field::toggle(
++                "video_acceleration",
++                "Video acceleration",
++                c.video_acceleration,
++                "The guest decodes, encodes and scales video on the host's hardware. Off, it \
++                 does all of that in software.",
++            )
++            .show_if("graphics", library),
+             Field::toggle(
+                 "audio",
+                 "Audio",
+@@ -2260,6 +2269,10 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
+             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
+         }
+     }
++    // Hidden on VMware SVGA, which has no video devices, it stays as it was.
++    if f.is_shown("video_acceleration") {
++        c.video_acceleration = f.toggle("video_acceleration");
++    }
+     c.audio.enabled = f.toggle("audio");
+     c.logs.enabled = f.toggle("logs");
+     if f.is_shown("log_level") && !f.text("log_level").is_empty() {
+@@ -2396,11 +2409,12 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
+               when its shutdown timeout ends (edit e to change it)
+   K           kill it: power it off at once
+   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
+-              GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
+-              and on x86-64 its disk controller (SATA, or NVMe once macOS is installed), its
+-              installer image, its boot selection (OpenCore's picker, which makes it a new
+-              OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA, one display
+-              with no GPU acceleration, in QEMU's own window
++              GPU, video acceleration (the host's hardware video decode, encode and
++              scaling), audio, network, logs, extra QEMU arguments (they apply at its next
++              start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
++              installed), its installer image, its boot selection (OpenCore's picker, which
++              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware
++              SVGA, one display with no GPU acceleration, in QEMU's own window
+   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
+               run it yourself, without reims-ctl
+   v           show a running VM's screen here, in the terminal, and use its keyboard and
+@@ -2825,6 +2839,50 @@ mod tests {
+         assert!(!form(&app).is_shown("disk_controller"));
+     }
+ 
++    /// The edit form turns video acceleration off on reims-vgpu, on either kind of VM, and has
++    /// no such field on VMware SVGA, which has no video devices, whose setting stays as it was.
++    #[test]
++    fn the_edit_form_turns_video_acceleration_off() {
++        let mut svga = vm_row("s", true);
++        let c = &mut svga.vm.as_mut().unwrap().config;
++        c.graphics = Graphics::VmwareSvga;
++        c.video_acceleration = false;
++        let mut arm64 = vm_row("a", false);
++        arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
++            aux: "aux.img".into(),
++            ecid: 1234,
++        });
++        let mut app = test_app(vec![vm_row("t", true), arm64, svga]);
++        for row in [0, 1] {
++            app.overlay = None;
++            app.table.select(Some(row));
++            app.open_edit();
++            assert!(form(&app).toggle("video_acceleration"));
++            for _ in 0..form(&app).fields.len() {
++                if form(&app).focused_key() == "video_acceleration" {
++                    break;
++                }
++                press(&mut app, [KeyCode::Down]);
++            }
++            press(&mut app, [KeyCode::Right]);
++            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
++            apply_edit(&mut vm, form(&app), None).unwrap();
++            assert!(!vm.config.video_acceleration);
++        }
++
++        app.overlay = None;
++        app.table.select(Some(2));
++        app.open_edit();
++        assert!(!form(&app).is_shown("video_acceleration"));
++        let mut vm = app.rows[2].vm.as_ref().unwrap().clone();
++        vm.config.video_acceleration = true;
++        apply_edit(&mut vm, form(&app), None).unwrap();
++        assert!(
++            vm.config.video_acceleration,
++            "a hidden field changes nothing"
++        );
++    }
++
+     #[test]
+     fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
+         let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+diff --git a/crates/reims-ctl/src/vm.rs b/crates/reims-ctl/src/vm.rs
+index c6351ea..9922617 100644
+--- a/crates/reims-ctl/src/vm.rs
++++ b/crates/reims-ctl/src/vm.rs
+@@ -32,6 +32,11 @@ pub struct VmConfig {
+     pub extra_args: Vec<String>,
+     #[serde(default, skip_serializing_if = "Graphics::is_reims_vgpu")]
+     pub graphics: Graphics,
++    /// The host's video decode, encode and scaling for the guest, on reims-vgpu: the
++    /// VideoToolbox and M2 scaler devices (`qemu`'s module doc). Off, the VM has neither, and
++    /// the guest does all three in software. On unless its settings say off.
++    #[serde(default = "on", skip_serializing_if = "is_on")]
++    pub video_acceleration: bool,
+     #[serde(default)]
+     pub display: Display,
+     #[serde(default)]
+@@ -54,6 +59,14 @@ fn default_stop_timeout() -> u64 {
+     DEFAULT_STOP_TIMEOUT.as_secs()
+ }
+ 
++fn on() -> bool {
++    true
++}
++
++fn is_on(b: &bool) -> bool {
++    *b
++}
++
+ /// How long `stop` waits for the guest by default.
+ pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+ 
+@@ -989,6 +1002,7 @@ mod tests {
+             stop_timeout_secs: 90,
+             extra_args: vec!["-boot".into(), "menu=on".into()],
+             graphics: Graphics::ReimsVgpu,
++            video_acceleration: true,
+             display: Display::default(),
+             gpu: Gpu {
+                 driver_file: Some("/usr/share/vulkan/icd.d/nvidia_icd.json".into()),
+@@ -1052,6 +1066,22 @@ mod tests {
+         }
+     }
+ 
++    /// A VM whose settings don't name video acceleration has it on, and saves as it did before
++    /// the switch existed; one with it off saves it off.
++    #[test]
++    fn video_acceleration_is_on_unless_the_settings_say_off() {
++        let mut c = x86_64_config();
++        let text = toml::to_string_pretty(&c).unwrap();
++        assert!(!text.contains("video_acceleration"), "{text}");
++        let loaded = toml::from_str::<VmConfig>(&text).unwrap();
++        assert!(loaded.video_acceleration);
++        assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
++        c.video_acceleration = false;
++        let off = toml::to_string_pretty(&c).unwrap();
++        assert!(off.contains("video_acceleration = false\n"), "{off}");
++        assert_eq!(toml::from_str::<VmConfig>(&off).unwrap(), c);
++    }
++
+     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`
+     /// gives.
+     #[test]
+diff --git a/docs/qemu.md b/docs/qemu.md
+index 19b62da..c5c3615 100644
+--- a/docs/qemu.md
++++ b/docs/qemu.md
+@@ -160,7 +160,8 @@ discrete ones first, where that GPU is a software rasterizer or offers
+ none. The library logs its choice and why; where no backend opens, the
+ guest is offered no codec and decodes in software. A VM takes it as
+ `-device apple-videotoolbox-pci`; reims-ctl gives every VM on reims-vgpu
+-one, an x86-64 VM's at slot 8.
++one, an x86-64 VM's at slot 8, unless its settings turn video
++acceleration off, which leaves out this device and the M2 scaler.
+ Queue 0's elements go to `rvg_video_device_deliver`, gathered across
+ descriptors, and its status is scattered into the writable part; one whose
+ readable part is over 16 MiB (`RVG_VIDEO_MAX_MESSAGE_SIZE`) is answered
+@@ -238,7 +239,8 @@ stays unset. The guest kext reads its status back, fails its start before
+ DRIVER_OK, writes FAILED and registers no service, and the guest's
+ IOSurfaceAccelerator does without it ([video/scaler.md](video/scaler.md),
+ "A host without a GPU"). A VM takes it as `-device apple-m2scaler-pci`;
+-reims-ctl gives every VM on reims-vgpu one, an x86-64 VM's at slot 9.
++reims-ctl gives every VM on reims-vgpu one, an x86-64 VM's at slot 9,
++unless its settings turn video acceleration off.
+ Each queue element's readable part, at most 64 KiB, is copied into one
+ buffer for `rvg_scaler_device_process`, which answers in place. A longer
+ one is a needs-reset before anything is allocated or copied, as the

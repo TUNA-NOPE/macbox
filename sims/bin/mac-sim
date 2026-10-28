@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# mac-sim: iOS Simulators on this machine's macOS VM (macbox), for agents. Local and free.
+# The VM is `ssh $MACBOX_SSH_HOST` (default: macbox).
+#
+#   mac-sim up [--full|--sharp|--small]  claim this checkout's simulator and boot it: slim by default;
+#                             --full: every iOS service (widgets, Live Activities, Dynamic Island, push);
+#                             --sharp: a real iPhone's pixels (3x), for detailed screenshots, slower;
+#                             --small: the small iPhone, for small-screen layouts
+#   mac-sim run               build this checkout's Expo app on the Mac (Debug), install and open it,
+#                             with Metro here (Fast Refresh). MODE=go: Expo Go instead of a build;
+#                             MODE=release: a Release build with the JavaScript inside, no Metro;
+#                             RN_FROM_SOURCE=1: React Native from source (slower; for old libraries)
+#   mac-sim snapshot          accessibility tree of the screen (refs like @e12)
+#   mac-sim ad <args>         any agent-device command on this checkout's simulator
+#   mac-sim shot <png>        lossless screenshot, copied here
+#   mac-sim record <mp4> [s]  H.264 video for s seconds (default 5), copied here
+#   mac-sim open <url>        open a URL or deep link in the simulator (exp://, https://, myapp://)
+#   mac-sim install <.app>    install an app built for the simulator (a path here or on the Mac)
+#   mac-sim udid              this checkout's simulator
+#   mac-sim t3                hostId and deviceId of this checkout's simulator, for T3 Code's device_open
+#   mac-sim mac <command>     run a shell command on the Mac ($UDID is this checkout's simulator)
+#   mac-sim logs              build, Metro and tunnel output
+#   mac-sim status            every simulator in the pool: kind, up or off, who uses it
+#   mac-sim down              stop Metro, release the simulator (all but the full one are shut down)
+#   mac-sim clean             delete this checkout's copy and build on the Mac
+#   mac-sim setup             copy the Mac-side helper and install agent-device on the Mac
+#   mac-sim idle [--dry-run] [name...]
+#                             shut down pool simulators idle for MAC_SIM_IDLE_MINUTES (20); run
+#                             every 5 minutes by the user timer mac-sim-idle.timer
+#
+# Each checkout (git root) gets its own simulator, so agents in different checkouts work
+# in parallel. MAC_SIM_DEVICE=<name or udid> picks one explicitly.
+# Settings: ~/.config/macbox/macbox.env (written by `macbox init`); the environment overrides it.
+set -uo pipefail
+
+# macbox's settings. Variables already set in the environment win over the file.
+MACBOX_CONFIG="${MACBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/macbox.env}"
+if [ -r "$MACBOX_CONFIG" ]; then
+  _env=$(declare -px | grep -E '^declare -x (MACBOX_|MAC_SIM_)' || true)
+  set -a
+  # shellcheck source=/dev/null
+  . "$MACBOX_CONFIG"
+  set +a
+  eval "$_env"; unset _env
+fi
+
+# The pool: one simulator per name in MACBOX_POOL. Its kind is the name without a "-N"
+# suffix (slim-1 -> slim), and the simulator on the Mac is called
+# "<device> (<MACBOX_SIM_PREFIX> <name with spaces>)", e.g. "iPhone 17 Pro (macbox slim 1)".
+# `macbox-guest pool create` makes them. mac-sim finds their UDIDs by name.
+#   full   every iOS service, 1x; also the user's own simulator, so `down` leaves it running
+#   slim   simslim turns about 170 background services off (less memory, no widgets,
+#          wallpaper, Live Activities or push), 1x: the fastest to animate
+#   sharp  slim at 3x (a real iPhone's pixels): slower to animate, for detailed stills
+#   small  slim small iPhone (an "e" model, 3x), for layout checks on small phones
+# Resolutions are fixed: changing one means restarting CoreSimulatorService, which shuts
+# down every simulator on the Mac.
+# MAC_SIM_POOL="name:udid:kind ..." skips the lookup and names the simulators explicitly.
+read -r -a POOL_NAMES <<<"${MACBOX_POOL:-full slim-1 slim-2 sharp small}"
+PREFIX="${MACBOX_SIM_PREFIX:-macbox}"
+POOL=() MISSING=()
+# A claim nobody has used for this long is free again (its simulator is shut down, but full).
+IDLE_HOURS="${MAC_SIM_IDLE_HOURS:-3}"
+# A booted simulator with no mac-sim command, viewer or app switch for this long is shut down
+# by `mac-sim idle` (its claim stays; the next mac-sim command boots it again).
+IDLE_MIN="${MAC_SIM_IDLE_MINUTES:-20}"
+HOST="${MAC_SIM_HOST:-${MACBOX_SSH_HOST:-macbox}}"
+T3_HOST_ID="${MACBOX_T3_HOST_ID:-$HOST}"
+# Metro for the i-th pool simulator listens on METRO_BASE + 2i (android-sim uses 8081 up).
+METRO_BASE="${MAC_SIM_METRO_BASE:-8101}"
+STATE_DIR="${MAC_SIM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/macbox/mac-sim}"
+CLAIMS="$STATE_DIR/claims"
+mkdir -p "$CLAIMS"
+HERE="$(dirname "$(readlink -f "$0")")"
+# The helper's folder on the Mac, relative to its home (agent-device is installed beside it).
+REMOTE_DIR="${MAC_SIM_REMOTE_DIR:-.local/lib/mac-sim}"
+REMOTE="~/$REMOTE_DIR/mac-sim-remote"
+# The agent-device the helper installs on the Mac if it has none.
+AD_VERSION="${MAC_SIM_AGENT_DEVICE_VERSION:-0.21.31}"
+DOWN_HINT="Is the VM up? (macbox status; macbox up)"
+
+# Set by set_device.
+NAME="" UDID="" KIND="" PORT="" DEV_DIR="" METRO_UNIT="" TUNNEL_UNIT="" SESSION=""
+STATES=""
+
+log() { printf 'mac-sim: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+# One SSH connection, reused for 10 minutes by every mac-sim command.
+# MAC_SIM_SSH_MASTER=no (the idle timer): use a running master, never start one.
+SSH=(ssh -o ControlMaster="${MAC_SIM_SSH_MASTER:-auto}" -o ControlPath="$STATE_DIR/ssh-%C" -o ControlPersist=600
+  -o ServerAliveInterval=30 -o ConnectTimeout=10 "$HOST")
+on_mac() { "${SSH[@]}" "$@"; }
+# remote <subcommand> <args...>: the Mac-side helper, arguments quoted for its shell.
+remote() { on_mac "MAC_SIM_LIB=~/$REMOTE_DIR MAC_SIM_AD_VERSION=$(printf '%q' "$AD_VERSION") $REMOTE $(printf '%q ' "$@")"; }
+
+SYNCED=""
+sync_remote() {
+  local mine theirs
+  [ -n "$SYNCED" ] && return 0
+  SYNCED=1
+  mine=$(sha1sum "$HERE/mac-sim-remote" | cut -c1-40)
+  theirs=$(on_mac "shasum $REMOTE 2>/dev/null | cut -c1-40") \
+    || die "the Mac doesn't answer over SSH ($HOST). $DOWN_HINT"
+  [ "$mine" = "$theirs" ] && return 0
+  on_mac "mkdir -p ~/$REMOTE_DIR && cat > $REMOTE.tmp && chmod +x $REMOTE.tmp && mv $REMOTE.tmp $REMOTE" \
+    < "$HERE/mac-sim-remote" || die "could not copy the helper to the Mac"
+}
+
+unit_active() { systemctl --user is-active -q "$1"; }
+
+# ------------------------------------------------------------------ the pool
+
+kind_of() { printf '%s' "${1%-[0-9]*}"; }      # slim-1 -> slim
+label_of() { printf '%s' "${1//-/ }"; }         # slim-1 -> "slim 1"
+
+# Fills POOL ("name:udid:kind") from STATES ("udid state name" for every simulator on the
+# Mac). A name that matches several simulators keeps its cached UDID, else a booted one.
+# Without STATES (the Mac didn't answer) the cache is used as it is.
+resolve_pool() {
+  local n cached matches pick cache="$STATE_DIR/pool.cache" new=""
+  if [ -n "${MAC_SIM_POOL:-}" ]; then read -r -a POOL <<<"$MAC_SIM_POOL"; return 0; fi
+  POOL=() MISSING=()
+  for n in "${POOL_NAMES[@]}"; do
+    cached=$(awk -v n="$n" '$1 == n {print $2; exit}' "$cache" 2>/dev/null)
+    if [ -z "$STATES" ]; then
+      if [ -n "$cached" ]; then POOL+=("$n:$cached:$(kind_of "$n")"); else MISSING+=("$n"); fi
+      continue
+    fi
+    matches=$(awk -v s=" ($PREFIX $(label_of "$n"))" '{
+        u = $1; st = $2; $1 = ""; $2 = ""; name = substr($0, 3)
+        if (length(name) > length(s) && substr(name, length(name) - length(s) + 1) == s) print u, st
+      }' <<<"$STATES")
+    pick=""
+    [ -n "$cached" ] && grep -q "^$cached " <<<"$matches" && pick=$cached
+    [ -n "$pick" ] || pick=$(awk '$2 == "Booted" {print $1; exit}' <<<"$matches")
+    [ -n "$pick" ] || pick=$(awk 'NR == 1 {print $1}' <<<"$matches")
+    if [ -n "$pick" ]; then POOL+=("$n:$pick:$(kind_of "$n")"); new+="$n $pick"$'\n'
+    else MISSING+=("$n"); fi
+  done
+  printf '%s' "$new" > "$cache"
+}
+
+spec_of() {  # spec_of <name or udid> -> "name udid kind"
+  local e n u k
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    { [ "$1" = "$n" ] || [ "${1^^}" = "$u" ]; } && { echo "$n $u $k"; return 0; }
+  done
+  return 1
+}
+
+set_device() {
+  local i=0 n spec
+  spec=$(spec_of "$1") || die "'$1' is not in the pool ($(printf '%s ' "${POOL[@]%%:*}"))$(missing_note)"
+  read -r NAME UDID KIND <<<"$spec"
+  for n in "${POOL_NAMES[@]}"; do [ "$n" = "$NAME" ] && break; i=$((i + 1)); done
+  PORT=$((METRO_BASE + 2 * i))
+  DEV_DIR="$STATE_DIR/$NAME"; mkdir -p "$DEV_DIR"
+  METRO_UNIT="macbox-sim-metro-$NAME"; TUNNEL_UNIT="macbox-sim-tunnel-$NAME"; SESSION="mac-sim-$NAME"
+}
+
+missing_note() {
+  [ ${#MISSING[@]} -eq 0 ] && return 0
+  printf '; not on the Mac: %s (macbox-guest pool create makes them)' "${MISSING[*]}"
+}
+
+# Each command that picks a simulator marks it used, for `mac-sim idle`: last-used is touched
+# when the command starts and when it ends, and busy.<pid> exists while it runs (a long build).
+mark_used() {
+  BUSY="$DEV_DIR/busy.$$" LAST_USED="$DEV_DIR/last-used"
+  : > "$BUSY"; touch "$LAST_USED"
+  trap 'rm -f "$BUSY"; touch "$LAST_USED"' EXIT
+}
+
+owner_key() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+claim_of() { cat "$CLAIMS/$1" 2>/dev/null; }
+claim_live() {
+  [ -s "$CLAIMS/$1" ] || return 1
+  [ $(( $(date +%s) - $(stat -c %Y "$CLAIMS/$1") )) -lt $(( IDLE_HOURS * 3600 )) ] && return 0
+  unit_active "macbox-sim-metro-$1"
+}
+
+states() { sync_remote; remote state 2>/dev/null; }
+load_states() { STATES=$(states); resolve_pool; }
+is_booted() { grep -q "^$1 Booted" <<<"$STATES"; }
+
+# Frees claims nobody used for IDLE_HOURS, shutting down their slim simulators.
+reap() {
+  local e n u k
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    [ -s "$CLAIMS/$n" ] && ! claim_live "$n" || continue
+    log "freeing $n (unused for ${IDLE_HOURS}h; was $(claim_of "$n"))"
+    set_device "$n"; release_device quiet
+  done
+}
+
+# Picks this checkout's simulator or claims a free one of the wanted kind.
+# claim=0 only looks (status, logs, down) and fails if the checkout has none.
+select_device() {
+  local claim="${1:-1}" want="${2:-}" key e n u k pick=""
+  key=$(owner_key)
+  exec 9>"$STATE_DIR/pool.lock"; flock 9
+  load_states
+  [ -n "$STATES" ] || { flock -u 9; die "the Mac doesn't answer over SSH ($HOST). $DOWN_HINT"; }
+  [ ${#POOL[@]} -gt 0 ] || { flock -u 9; die "no pool simulator on the Mac$(missing_note)"; }
+  if [ -n "${MAC_SIM_DEVICE:-}" ]; then
+    set_device "$MAC_SIM_DEVICE"; mark_used
+    [ "$claim" = 1 ] && printf '%s\n' "$key" > "$CLAIMS/$NAME"
+    flock -u 9; return 0
+  fi
+  if [ -n "$want" ] && ! printf '%s\n' "${POOL[@]}" | cut -d: -f3 | grep -qx "$want"; then
+    flock -u 9
+    die "the pool has no $want simulator (kinds: $(printf '%s\n' "${POOL[@]}" | cut -d: -f3 | sort -u | tr '\n' ' '))$(missing_note)"
+  fi
+  [ "$claim" = 1 ] && reap
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    if [ "$(claim_of "$n")" = "$key" ] && claim_live "$n"; then
+      if [ -n "$want" ] && [ "$want" != "$k" ]; then
+        log "this checkout had $n ($k); switching to a $want simulator"
+        set_device "$n"; release_device quiet
+        break
+      fi
+      set_device "$n"; mark_used; touch "$CLAIMS/$n"; flock -u 9; return 0
+    fi
+  done
+  [ "$claim" = 1 ] || { flock -u 9; die "this checkout ($key) has no simulator; mac-sim up"; }
+  want="${want:-slim}"
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    [ "$k" = "$want" ] && ! claim_live "$n" && { pick="$n"; break; }
+  done
+  [ -n "$pick" ] || { flock -u 9; die "every $want simulator is in use: $(cmd_status | tr '\n' ' ') Wait, or ask the user."; }
+  printf '%s\n' "$key" > "$CLAIMS/$pick"
+  set_device "$pick"; mark_used
+  flock -u 9
+  log "using $NAME ($KIND, $UDID) for $key"
+}
+
+# ------------------------------------------------------------------ simulator
+
+cmd_up() {
+  sync_remote
+  if ! is_booted "$UDID"; then
+    if [ -s "$DEV_DIR/idle-shutdown" ]; then
+      log "$NAME was shut down at $(cut -c12-16 "$DEV_DIR/idle-shutdown") UTC after ${IDLE_MIN} idle minutes; booting it again (apps that were open are closed: mac-sim run)"
+    else
+      log "booting $NAME"
+    fi
+    remote boot "$UDID" || return 1
+    STATES=$(states)
+  fi
+  rm -f "$DEV_DIR/idle-shutdown"
+  echo "up: $NAME ($KIND) $UDID"
+  t3_hint
+}
+
+ad() { remote ad "$UDID" "$SESSION" "$@"; }
+
+# Runs an agent-device command; opens a session on Settings when there is none.
+run_ad() {
+  local out rc
+  out=$(ad "$@" 2>&1); rc=$?
+  if [ $rc -ne 0 ] && grep -qiE 'no active session|SESSION_NOT_FOUND|not connected|No device|open an app first' <<<"$out"; then
+    local app; app=$(cat "$DEV_DIR/app" 2>/dev/null)
+    ad open "${app:-com.apple.Preferences}" >/dev/null 2>&1
+    out=$(ad "$@" 2>&1); rc=$?
+  fi
+  printf '%s\n' "$out"; return $rc
+}
+
+ensure_ready() { select_device 1; is_booted "$UDID" || cmd_up >/dev/null || exit 1; sync_remote; }
+
+# Paths: a file here is copied over; a path that only exists on the Mac is used as is.
+fetch() {  # fetch <remote tmp> <local path>
+  mkdir -p "$(dirname "$2")"
+  scp -q -o ControlPath="$STATE_DIR/ssh-%C" "$HOST:$1" "$2" && on_mac "rm -f $(printf '%q' "$1")"
+}
+
+cmd_shot() {
+  local out="$1" tmp="/tmp/mac-sim-$NAME-$$.png"
+  remote shot "$UDID" "$tmp" || exit 1
+  fetch "$tmp" "$out" || die "could not copy the screenshot"
+  echo "$out ($(identify -format '%wx%h' "$out" 2>/dev/null || echo saved))"
+}
+
+cmd_record() {
+  local out="$1" secs="${2:-5}" tmp="/tmp/mac-sim-$NAME-$$.mp4"
+  remote record "$UDID" "$secs" "$tmp" || exit 1
+  fetch "$tmp" "$out" || die "could not copy the video"
+  # The simulator writes a frame only when the screen changes: a still screen gives few frames.
+  echo "$out ($(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$out" 2>/dev/null | awk -F, '{printf "%sx%s, %s frames", $1, $2, $3}') in ${secs}s; frames are written only when the screen changes)"
+}
+
+cmd_install() {
+  local app="${1%/}" dest id
+  [ -n "$app" ] || die "usage: mac-sim install <path/To.app>"
+  if [ -d "$app" ]; then
+    dest="/tmp/mac-sim-install-$NAME/$(basename "$app")"
+    on_mac "rm -rf $(printf '%q' "$(dirname "$dest")") && mkdir -p $(printf '%q' "$(dirname "$dest")")"
+    tar -C "$(dirname "$app")" -cf - "$(basename "$app")" | on_mac "tar -C $(printf '%q' "$(dirname "$dest")") -xf -" \
+      || die "could not copy $app to the Mac"
+    app="$dest"
+  fi
+  id=$(remote install "$UDID" "$app") || exit 1
+  printf '%s' "$id" > "$DEV_DIR/app"
+  remote launch "$UDID" "$id" || true
+  echo "installed and opened $id on $NAME"
+}
+
+stop_metro() {
+  systemctl --user stop "$METRO_UNIT" "$TUNNEL_UNIT" >/dev/null 2>&1 || true
+}
+
+release_device() {
+  stop_metro
+  ad close >/dev/null 2>&1 || true
+  # The full simulator is also the user's own; it stays up.
+  if [ "$KIND" != full ]; then remote shutdown "$UDID" >/dev/null 2>&1 || true; fi
+  rm -f "$CLAIMS/$NAME" "$DEV_DIR/app" "$DEV_DIR/idle-shutdown"
+  [ "${1:-}" = quiet ] || echo "$NAME released$([ "$KIND" != full ] && echo ' and shut down')"
+}
+
+# ------------------------------------------------------------------ Expo Go
+
+ROOT="" APPDIR=""
+
+detect_app_dir() {
+  if [ -n "${APP_DIR:-}" ]; then printf '%s' "${APP_DIR%/}"; return 0; fi
+  local cands here d n
+  cands=$(cd "$ROOT" && find . -maxdepth 4 \
+      \( -name node_modules -o -name .git -o -name ios -o -name android \) -prune \
+      -o \( -name app.json -o -name app.config.ts -o -name app.config.js \) -exec dirname {} \; 2>/dev/null \
+    | sort -u \
+    | while read -r d; do
+        grep -q '"expo"[[:space:]]*:' "$d/package.json" 2>/dev/null && printf '%s\n' "${d#./}"
+      done)
+  n=$(printf '%s' "$cands" | grep -c . || true)
+  [ "$n" -gt 0 ] || { log "no Expo app found in $ROOT; set APP_DIR"; return 1; }
+  if [ "$n" -gt 1 ]; then
+    here=$(git rev-parse --show-prefix 2>/dev/null)
+    while read -r d; do
+      [ "$d" != "." ] && case "$here" in "$d"/*) printf '%s' "$d"; return 0 ;; esac
+    done <<<"$cands"
+    log "several Expo apps here; set APP_DIR to one of: $(printf '%s' "$cands" | tr '\n' ' ')"
+    return 1
+  fi
+  printf '%s' "$cands"
+}
+
+sdk_major() {
+  local v
+  v=$(cd "$1" && node -p 'require("expo/package.json").version' 2>/dev/null) \
+    || v=$(jq -r '.dependencies.expo // empty' "$1/package.json" | tr -cd '0-9.' )
+  printf '%s' "${v%%.*}"
+}
+
+# Metro runs here, from this checkout, so saved files reach the app (Fast Refresh). The
+# simulator reaches it as 127.0.0.1:PORT on the Mac through an SSH tunnel.
+start_metro() {  # start_metro <app dir> [--go]
+  stop_metro
+  : > "$DEV_DIR/metro.log"
+  systemd-run --user --unit="$METRO_UNIT" --collect --quiet -p WorkingDirectory="$1" \
+    -p StandardOutput="append:$DEV_DIR/metro.log" -p StandardError="append:$DEV_DIR/metro.log" \
+    --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CI=0 --setenv=EXPO_NO_TELEMETRY=1 \
+    npx expo start ${2:-} --localhost --port "$PORT" || die "could not start Metro"
+  for _ in $(seq 1 90); do
+    curl -fsS -m 2 "http://127.0.0.1:$PORT/status" 2>/dev/null | grep -q running && break
+    unit_active "$METRO_UNIT" || { tail -20 "$DEV_DIR/metro.log" >&2; die "Metro stopped"; }
+    sleep 2
+  done
+  on_mac "lsof -tiTCP:$PORT -sTCP:LISTEN | xargs kill 2>/dev/null; true"   # a stale tunnel end
+  : > "$DEV_DIR/tunnel.log"
+  systemd-run --user --unit="$TUNNEL_UNIT" --collect --quiet \
+    -p StandardOutput="append:$DEV_DIR/tunnel.log" -p StandardError="append:$DEV_DIR/tunnel.log" \
+    ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ControlMaster=no \
+      -R "127.0.0.1:$PORT:127.0.0.1:$PORT" "$HOST" || die "could not start the tunnel to the Mac"
+  for _ in $(seq 1 20); do
+    on_mac "curl -fsS -m 2 http://127.0.0.1:$PORT/status" 2>/dev/null | grep -q running && return 0
+    sleep 1
+  done
+  die "the Mac can't reach Metro through the tunnel (mac-sim logs)"
+}
+
+# This checkout's folder name on the Mac: its name plus a hash of its path.
+checkout_key() {
+  printf '%s-%s' "$(basename "$ROOT" | tr -c 'A-Za-z0-9._\n-' '-')" "$(printf '%s' "$ROOT" | sha1sum | cut -c1-6)"
+}
+
+# Copies the checkout to the Mac (not node_modules, .git or generated native folders),
+# then builds it there with Xcode for this simulator.
+build_on_mac() {  # build_on_mac <Debug|Release>
+  local conf="$1" key src id rel kind=managed excl=()
+  key=$(checkout_key)
+  src=".mac-sim/src/$key"
+  rel="${APPDIR#.}"; rel="${rel#/}"; rel="${rel:+/$rel}"
+  # A project with its own ios/ folder in git (bare React Native) is built as it is;
+  # otherwise ios/ is generated on the Mac (expo prebuild) and a local one is not copied.
+  if [ -n "$(git -C "$ROOT" ls-files "${rel#/}${rel:+/}ios" | head -1)" ]; then kind=bare
+  else excl=(--exclude "$rel/ios/"); fi
+  log "copying $ROOT to the Mac"
+  on_mac "mkdir -p $src" || die "the Mac doesn't answer"
+  rsync -a --delete -e "ssh -o ControlPath=$STATE_DIR/ssh-%C" \
+    --exclude node_modules --exclude .git --exclude .expo --exclude .mac-sim \
+    --exclude "$rel/android/" "${excl[@]}" \
+    "$ROOT/" "$HOST:$src/" || die "copying the checkout to the Mac failed"
+  log "building $APPDIR on the Mac ($conf; the first build of a project takes 5 to 15 minutes)"
+  : > "$DEV_DIR/build.log"
+  remote build "$src" "$APPDIR" "$UDID" "$PORT" "$conf" "$kind" \
+    "$([ "${RN_FROM_SOURCE:-}" = 1 ] && echo source || echo prebuilt)" >>"$DEV_DIR/build.log" 2>&1
+  local rc=$?
+  grep -E '^== ' "$DEV_DIR/build.log" >&2
+  [ $rc -eq 0 ] || { tail -30 "$DEV_DIR/build.log" >&2; die "the build failed (mac-sim logs)"; }
+  id=$(sed -n 's/^BUNDLE_ID=//p' "$DEV_DIR/build.log" | tail -1)
+  [ -n "$id" ] || die "built, but no bundle id came back (mac-sim logs)"
+  printf '%s' "$id" > "$DEV_DIR/app"
+}
+
+cmd_run() {
+  ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside the app's git checkout"
+  APPDIR=$(detect_app_dir) || exit 1
+  local dir="$ROOT/$APPDIR" mode="${MODE:-build}" sdk id
+  [ -d "$dir/node_modules/expo" ] || die "install the app's dependencies here first (npm install / bun install in $dir)"
+  select_device 1
+  cmd_up >/dev/null || exit 1
+  case "$mode" in
+    go)
+      sdk=$(sdk_major "$dir"); [ -n "$sdk" ] || die "can't tell the app's Expo SDK version"
+      remote expogo "$UDID" "$sdk" >&2 || exit 1
+      start_metro "$dir" --go
+      printf '%s' host.exp.Exponent > "$DEV_DIR/app"
+      remote openurl "$UDID" "exp://127.0.0.1:$PORT" || die "could not open the app"
+      # iOS asks "Open in 'Expo Go'?" for a link from outside the app.
+      ad alert accept 5000 >/dev/null 2>&1 || true
+      echo "running $APPDIR (SDK $sdk) in Expo Go on $NAME, Metro on :$PORT" ;;
+    build|debug)
+      start_metro "$dir"
+      build_on_mac Debug
+      id=$(cat "$DEV_DIR/app")
+      remote launch "$UDID" "$id" || die "could not open $id"
+      echo "running $id (Debug build) on $NAME, Metro on :$PORT" ;;
+    release)
+      stop_metro
+      build_on_mac Release
+      id=$(cat "$DEV_DIR/app")
+      remote launch "$UDID" "$id" || die "could not open $id"
+      echo "running $id (Release build) on $NAME" ;;
+    *) die "MODE must be build, go or release" ;;
+  esac
+  t3_hint
+}
+
+# ------------------------------------------------------------------ idle shutdown
+
+# A booted pool simulator is idle, and `mac-sim idle` shuts it down, when for IDLE_MIN minutes:
+#   - no mac-sim command used it (last-used, the claim's time; busy.<pid> while one runs),
+#   - no viewer had it open (T3's Device panel, a hub's WebRTC viewer, Simulator.app; see
+#     idleinfo in mac-sim-remote), checked every run and remembered in last-viewed,
+#   - no app came to the foreground (SpringBoard's log),
+#   - and it was booted at least that long ago.
+# The claim, Metro and the tunnel stay, so the next mac-sim command boots it again and a
+# Debug build finds Metro. Simulators outside the pool are never touched.
+IDLE_LOG="$STATE_DIR/idle.log"
+
+mins_since() {  # minutes since the newest of these files changed (99999: none exists)
+  local f t newest=0
+  for f in "$@"; do t=$(stat -c %Y "$f" 2>/dev/null) && [ "$t" -gt "$newest" ] && newest=$t; done
+  [ "$newest" -gt 0 ] && echo $(( ($(date +%s) - newest) / 60 )) || echo 99999
+}
+
+busy_pids() {  # mac-sim commands still running on this simulator
+  local f p
+  for f in "$DEV_DIR"/busy.*; do
+    [ -e "$f" ] || continue
+    p=${f##*.}
+    if grep -qa mac-sim "/proc/$p/cmdline" 2>/dev/null; then echo "$p"; else rm -f "$f"; fi
+  done
+}
+
+# Prints why this simulator is in use, or nothing if mac-sim hasn't touched it for IDLE_MIN.
+mac_sim_activity() {
+  local p used
+  p=$(busy_pids | tr '\n' ' ')
+  [ -z "$p" ] || { echo "a mac-sim command is running (pid ${p% })"; return; }
+  used=$(mins_since "$DEV_DIR/last-used" "$CLAIMS/$NAME")
+  [ "$used" -ge "$IDLE_MIN" ] || echo "last mac-sim command ${used} min ago"
+}
+
+cmd_idle() {
+  local dry="${MAC_SIM_IDLE_DRY_RUN:-}" only=() udids=() e n u k info state booted viewers why seen fg act res up=0
+  [[ "$IDLE_MIN" =~ ^[0-9]+$ ]] || die "MAC_SIM_IDLE_MINUTES must be a number of minutes"
+  while [ $# -gt 0 ]; do
+    case "$1" in --dry-run|-n) dry=1 ;; *) only+=("$1") ;; esac; shift
+  done
+  on_mac true 2>/dev/null || { log "the Mac doesn't answer over SSH; nothing to check"; return 0; }
+  load_states
+  [ -n "$STATES" ] || { log "the Mac couldn't list its simulators"; return 0; }
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    [ ${#only[@]} -eq 0 ] || [[ " ${only[*]} " == *" $n "* ]] && udids+=("$u")
+  done
+  [ ${#udids[@]} -gt 0 ] || { [ ${#only[@]} -gt 0 ] && die "no pool simulator called ${only[*]}"; log "no pool simulator on the Mac$(missing_note)"; return 0; }
+  info=$(remote idleinfo "${udids[@]}") || { log "the Mac couldn't list its simulators"; return 0; }
+  while read -r u state booted viewers _; do
+    [ "$state" = Booted ] || continue
+    set_device "$u"; up=$((up + 1))
+    if [ "$viewers" != "logstream=0,webrtc=0,simapp=0" ]; then
+      touch "$DEV_DIR/last-viewed"; echo "$NAME: kept, watched now ($viewers)"; continue
+    fi
+    act=$(mac_sim_activity)
+    [ -z "$act" ] || { echo "$NAME: kept, $act"; continue; }
+    why=$(mins_since "$DEV_DIR/last-used" "$CLAIMS/$NAME")
+    [ "$why" = 99999 ] && why="no mac-sim command" || why="last mac-sim command ${why} min ago"
+    seen=$(mins_since "$DEV_DIR/last-viewed")
+    [ "$seen" -ge "$IDLE_MIN" ] || { echo "$NAME: kept, watched ${seen} min ago"; continue; }
+    [ "$seen" = 99999 ] || why+=", last watched ${seen} min ago"
+    [ "$booted" -ge "$IDLE_MIN" ] || { echo "$NAME: kept, booted ${booted} min ago"; continue; }
+    why+=", booted ${booted} min ago"
+    fg=$(remote appswitches "$UDID" "$IDLE_MIN" </dev/null) || fg="?"
+    [ "${fg%% *}" = 0 ] || { echo "$NAME: kept, app switches in the last ${IDLE_MIN} min: $fg"; continue; }
+    why="idle for ${IDLE_MIN}+ min ($why, no viewer, no app switch)"
+    if [ -n "$dry" ]; then
+      echo "$NAME: would shut down (dry run): $why"
+      printf '%s %s (%s, %s): would shut down (dry run): %s\n' "$(date -Is)" "$NAME" "$KIND" "$UDID" "$why" >> "$IDLE_LOG"
+      continue
+    fi
+    # Under the pool lock, so a mac-sim command that starts now waits and then boots it again.
+    exec 9>"$STATE_DIR/pool.lock"; flock 9
+    act=$(mac_sim_activity)
+    if [ -n "$act" ]; then flock -u 9; echo "$NAME: kept, $act"; continue; fi
+    res=$(remote idleshutdown "$UDID" "$SESSION" </dev/null 2>&1)
+    [ "$res" = shutdown ] && date -Is > "$DEV_DIR/idle-shutdown"
+    flock -u 9
+    if [ "$res" = shutdown ]; then
+      echo "$NAME: shut down: $why"
+      printf '%s %s (%s, %s): shut down: %s\n' "$(date -Is)" "$NAME" "$KIND" "$UDID" "$why" >> "$IDLE_LOG"
+    else
+      [[ "$res" == watched* ]] && touch "$DEV_DIR/last-viewed"
+      echo "$NAME: kept, $res"
+    fi
+  done <<<"$info"
+  [ "$up" -gt 0 ] || { [ -z "$dry" ] && [ ! -t 1 ]; } || echo "no pool simulator is up"
+}
+
+# ------------------------------------------------------------------ status
+
+t3_hint() {
+  [ -n "${T3CODE_PROJECT_ROOT:-}${T3CODE_HOME:-}" ] || return 0
+  echo "T3 Code: call device_open with hostId \"$T3_HOST_ID\" and deviceId \"$UDID\" so the user sees it in the Device panel"
+}
+
+cmd_status() {
+  local e n u k line
+  [ -n "$STATES" ] || load_states
+  [ -n "$STATES" ] || log "the Mac doesn't answer over SSH ($HOST); showing what mac-sim remembers"
+  for e in "${POOL[@]}"; do
+    IFS=: read -r n u k <<<"$e"
+    set_device "$n"
+    if is_booted "$u"; then line="$n ($k): up"; else line="$n ($k): off"; fi
+    ! is_booted "$u" && [ -s "$DEV_DIR/idle-shutdown" ] && line+=" (shut down idle at $(cut -c12-16 "$DEV_DIR/idle-shutdown") UTC)"
+    claim_live "$n" && line+=", used by $(claim_of "$n")"
+    [ -s "$DEV_DIR/app" ] && claim_live "$n" && line+=", app $(cat "$DEV_DIR/app")"
+    unit_active "$METRO_UNIT" && line+=", Metro on :$PORT"
+    echo "$line"
+  done
+  for n in "${MISSING[@]}"; do echo "$n ($(kind_of "$n")): not on the Mac (macbox-guest pool create)"; done
+}
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  up)
+    want=""
+    case "${1:-}" in --*) want="${1#--}" ;; "") ;; *) die "usage: mac-sim up [--full|--sharp|--small]" ;; esac
+    select_device 1 "$want"; cmd_up ;;
+  run)      cmd_run ;;
+  snapshot) ensure_ready; run_ad snapshot "$@" ;;
+  ad)       ensure_ready; run_ad "$@" ;;
+  shot)     [ -n "${1:-}" ] || die "usage: mac-sim shot <path.png>"; ensure_ready; cmd_shot "$1" ;;
+  record)   [ -n "${1:-}" ] || die "usage: mac-sim record <path.mp4> [seconds]"; ensure_ready; cmd_record "$1" "${2:-5}" ;;
+  open)     [ -n "${1:-}" ] || die "usage: mac-sim open <url>"; ensure_ready; remote openurl "$UDID" "$1"; ad alert accept 3000 >/dev/null 2>&1 || true ;;
+  install)  ensure_ready; cmd_install "${1:-}" ;;
+  udid)     select_device 0; echo "$UDID" ;;
+  t3)       select_device 0; echo "hostId=$T3_HOST_ID deviceId=$UDID" ;;
+  mac)      select_device 1; on_mac "export UDID=$UDID; $*" ;;
+  logs)
+    select_device 0
+    for f in build metro tunnel; do [ -s "$DEV_DIR/$f.log" ] && { echo "== $NAME $f"; tail -40 "$DEV_DIR/$f.log"; }; done ;;
+  status)   cmd_status ;;
+  idle)     cmd_idle "$@" ;;
+  down)     select_device 0; release_device ;;
+  setup)    sync_remote; remote setup ;;
+  clean)
+    ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside the app's git checkout"
+    k=$(checkout_key)
+    on_mac "rm -rf .mac-sim/src/$(printf '%q' "$k")" && echo "deleted the Mac's copy and build of $ROOT (.mac-sim/src/$k)" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

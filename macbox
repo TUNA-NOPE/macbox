@@ -1,0 +1,618 @@
+#!/bin/bash
+# macbox: a full macOS VM with GPU acceleration on a Linux host, in Docker, with Xcode, a pool of
+# iOS Simulators, T3 Code's Device panel and tools for AI coding agents. `macbox help` lists the
+# commands; docs/setup.md walks through a new install.
+set -euo pipefail
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CONF="${MACBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/macbox/macbox.env}"
+# The config file, then the environment over it.
+_env="$(declare -px | grep -E '^declare -x MACBOX_[A-Z0-9_]+=' || true)"
+[ -f "$CONF" ] && . "$CONF"
+eval "$_env"
+: "${MACBOX_HOME:=$HOME/.local/share/macbox}"
+: "${MACBOX_VM:=mac}" "${MACBOX_CONTAINER:=macbox}" "${MACBOX_IMAGE:=macbox:run}"
+: "${MACBOX_SSH_HOST:=macbox}" "${MACBOX_SSH_PORT:=2226}" "${MACBOX_SCREEN_PORT:=6081}"
+: "${MACBOX_GUEST_USER:=dev}" "${MACBOX_CPUS:=8}" "${MACBOX_MEMORY:=12G}" "${MACBOX_DISK_SIZE:=160G}"
+: "${MACBOX_RESOLUTION:=1920x1080}" "${MACBOX_REFRESH:=60}" "${MACBOX_CPUSET:=}"
+: "${MACBOX_RENDER_NODE:=/dev/dri/renderD128}" "${MACBOX_DISK_CACHE:=writeback}" "${MACBOX_GPU_TUNING:=auto}"
+: "${MACBOX_SIM_PREFIX:=macbox}" "${MACBOX_POOL:=full slim-1 slim-2 sharp small}"
+: "${MACBOX_T3_HOST_ID:=$MACBOX_SSH_HOST}" "${MACBOX_T3_SETTINGS:=$HOME/.t3/userdata/settings.json}"
+DOCKER="${MACBOX_DOCKER:-docker}"
+C=$MACBOX_CONTAINER
+CHOME="$MACBOX_HOME/home"                       # the container's HOME
+DATA="$CHOME/.local/share/reims-ctl"
+VMDIR="$DATA/vms/$MACBOX_VM"
+RUN="$MACBOX_HOME/run" LOGS="$MACBOX_HOME/logs"
+KEY="$HOME/.ssh/macbox_ed25519"
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'macbox: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+need_init() { [ -f "$CONF" ] || die "no config yet: run macbox init first"; }
+
+# --- the container ---------------------------------------------------------------------------
+image_built() { $DOCKER image inspect "$MACBOX_IMAGE" >/dev/null 2>&1; }
+container_up() { [ -n "$($DOCKER ps -q -f "name=^${C}$")" ]; }
+cenv() {  # the environment every container process gets
+  printf '%s\n' -e "HOME=$CHOME" -e "MACBOX_HOME=$MACBOX_HOME" -e "MACBOX_REPO=$REPO" \
+    -e "MACBOX_RENDER_NODE=$MACBOX_RENDER_NODE" -e "MACBOX_RESOLUTION=$MACBOX_RESOLUTION" \
+    -e "MACBOX_SCREEN_PORT=$MACBOX_SCREEN_PORT"
+  local v
+  for v in MACBOX_STREAM_ORIGINS MACBOX_STREAM_BITRATE MACBOX_STREAM_TITLE; do
+    [ -n "${!v:-}" ] && printf '%s\n' -e "$v=${!v}"
+  done
+  return 0
+}
+in_c() { local e; mapfile -t e < <(cenv); $DOCKER exec "${e[@]}" "$C" "$@"; }
+ctl() { in_c bash -c '. "$HOME/.cargo/env"; exec reims-ctl "$@"' reims-ctl "$@"; }
+host_wayland() {  # the invoking user's own Wayland socket, for `view local`
+  local d="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" w="${WAYLAND_DISPLAY:-}"
+  [ -n "$w" ] || return 1
+  case "$w" in /*) ;; *) w="$d/$w" ;; esac
+  [ -S "$w" ] && echo "$w"
+}
+container_start() {
+  container_up && return 0
+  image_built || die "the image $MACBOX_IMAGE isn't built: run macbox build"
+  $DOCKER rm -f "$C" >/dev/null 2>&1 || true
+  local e dev=(--device /dev/kvm --device "$MACBOX_RENDER_NODE") vol=() wl
+  mapfile -t e < <(cenv)
+  [ -e /dev/udmabuf ] && dev+=(--device /dev/udmabuf)   # AMD GPUs import guest memory through it
+  if [ "$(view)" = local ]; then
+    if wl=$(host_wayland); then vol=(-v "$wl:/tmp/host-wayland/wayland-0")
+    else warn "view local, but this shell has no Wayland session (WAYLAND_DISPLAY): the window goes to the browser stream"; fi
+  fi
+  # seccomp/AppArmor unconfined: passt, the VM's network, needs a user namespace.
+  $DOCKER run -d --name "$C" --init "${e[@]}" \
+    --security-opt seccomp=unconfined --security-opt apparmor=unconfined "${dev[@]}" \
+    -v "$MACBOX_HOME:$MACBOX_HOME" -v "$REPO:$REPO:ro" "${vol[@]}" \
+    -p "127.0.0.1:$MACBOX_SSH_PORT:22" -p "127.0.0.1:$MACBOX_SCREEN_PORT:6080" \
+    "$MACBOX_IMAGE" sleep infinity >/dev/null
+}
+vm_exists() { [ -f "$VMDIR/vm.toml" ]; }
+vm_running() { container_up && ctl list 2>/dev/null | grep -qE "^${MACBOX_VM}[[:space:]]+running"; }
+qemu_pid() { $DOCKER top "$C" -eo pid,args 2>/dev/null | awk '/qemu-system-x86_64/ {print $1; exit}'; }
+view() { cat "$RUN/view" 2>/dev/null || echo stream; }
+resolution() { cat "$RUN/resolution" 2>/dev/null || echo "$MACBOX_RESOLUTION"; }
+build_id() { readlink "$DATA/qemu/current" 2>/dev/null || true; }
+ssh_ok() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$MACBOX_SSH_HOST" true >/dev/null 2>&1; }
+guest() { ssh -o ConnectTimeout=10 "$MACBOX_SSH_HOST" "$@"; }
+
+# --- GPU tuning: macbox's metal2vulkan patches, read at QEMU's start -------------------------
+# host_rt_in_place renders guest-RAM textures (the desktop's framebuffer, the simulator's screen)
+# in place; M2V_ARL_FACTS are driver facts measured on Intel's Arrow Lake iGPU only.
+ARL_FACTS="InterlockOrdersDraws,ShadowCopyBackDispatchFaster,ShadowCopyInDispatchFaster,RowCopiesDispatchFaster,SampledDepthKeepsHiZ,MultisampledDepthFasterOutOfGeneral,SampledFetchRecoversCodes,RobustIndexFetchReadsZero,FirstSparseResourceWaitsForQueues,InterlockedPassSplitNoSlower,CompressedImagesHideAliasedWrites"
+gpu_is_arl() {  # Intel Arrow Lake (Core Ultra 200S/HX/H graphics): PCI device 0x7d67, 0x7dd1, 0x7d41, 0x7d51, 0x7d45
+  local dev
+  dev=$(cat "/sys/class/drm/$(basename "$MACBOX_RENDER_NODE")/device/device" 2>/dev/null || true)
+  case "$dev" in 0x7d67|0x7dd1|0x7d41|0x7d51|0x7d45) return 0 ;; esac
+  return 1
+}
+tuning_on() {
+  case "$MACBOX_GPU_TUNING" in
+    on) return 0 ;; off) return 1 ;;
+    *) [[ "$(build_id)" == *-macbox ]] ;;
+  esac
+}
+apply_tuning() {  # before each start
+  if tuning_on; then
+    [ -s "$RUN/live.conf" ] || printf '# metal2vulkan live switches (patches/metal2vulkan), re-read every second\nhost_rt_in_place=1\n' >"$RUN/live.conf"
+    local env=(--env "M2V_LIVE=$RUN/live.conf")
+    if gpu_is_arl; then env+=(--env "M2V_ARL_FACTS=$ARL_FACTS"); else env+=(--env "M2V_ARL_FACTS="); fi
+    ctl set "$MACBOX_VM" "${env[@]}" >/dev/null
+  else
+    ctl set "$MACBOX_VM" --env "M2V_LIVE=" --env "M2V_ARL_FACTS=" >/dev/null
+  fi
+}
+
+qemu_extra() {  # the network (passt, SSH forwarded by Docker) and the disk's options
+  local mac a out=()
+  mac=$(cat "$RUN/mac")
+  for a in -netdev '{"type":"passt","id":"net0","tcp-ports":[{"str":"22"}],"ipv6":false}' \
+    -device "virtio-net-pci,netdev=net0,id=net0,mac=$mac,addr=0x3" \
+    -set "drive.disk.cache=$MACBOX_DISK_CACHE" -set drive.disk.discard=unmap; do
+    out+=("$(printf '%q' "$a")")
+  done
+  echo "${out[*]}"
+}
+
+cmd_init() {
+  local cdir; cdir=$(dirname "$CONF")
+  mkdir -p "$cdir" "$MACBOX_HOME"/{home,run,logs,shots}
+  if [ -f "$CONF" ]; then
+    say "config: $CONF (kept)"
+  else
+    local cpus mem_gb mem node
+    cpus=$(( $(nproc) / 2 )); [ "$cpus" -gt 8 ] && cpus=8; [ "$cpus" -lt 4 ] && cpus=4
+    mem_gb=$(( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) / 3 ))
+    [ "$mem_gb" -gt 16 ] && mem_gb=16; [ "$mem_gb" -lt 8 ] && mem_gb=8; mem="${mem_gb}G"
+    node=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
+    cat >"$CONF" <<EOF
+# macbox settings (sourced by bash; the environment overrides them). See docs/setup.md and docs/architecture.md.
+MACBOX_HOME=$MACBOX_HOME
+MACBOX_VM=$MACBOX_VM
+MACBOX_CONTAINER=$MACBOX_CONTAINER
+MACBOX_IMAGE=$MACBOX_IMAGE
+# SSH alias for the guest (written to ~/.ssh/config) and the ports on 127.0.0.1
+MACBOX_SSH_HOST=$MACBOX_SSH_HOST
+MACBOX_SSH_PORT=$MACBOX_SSH_PORT
+MACBOX_SCREEN_PORT=$MACBOX_SCREEN_PORT
+MACBOX_GUEST_USER=$MACBOX_GUEST_USER
+# The VM (cpus, memory and disk apply at macbox create; cpus/memory later with reims-ctl set)
+MACBOX_CPUS=$cpus
+MACBOX_MEMORY=$mem
+MACBOX_DISK_SIZE=$MACBOX_DISK_SIZE
+MACBOX_RESOLUTION=$MACBOX_RESOLUTION
+MACBOX_REFRESH=$MACBOX_REFRESH
+# Host CPUs to pin QEMU to (taskset list, e.g. 0-7 for the performance cores); empty: no pinning
+MACBOX_CPUSET=$MACBOX_CPUSET
+# Host CPUs for macbox build (taskset list, e.g. the efficiency cores); empty: all
+MACBOX_BUILD_CPUSET=${MACBOX_BUILD_CPUSET:-}
+MACBOX_RENDER_NODE=${node:-$MACBOX_RENDER_NODE}
+# writeback (safe) or unsafe (faster; a crash of the host itself can corrupt the VM's disk)
+MACBOX_DISK_CACHE=$MACBOX_DISK_CACHE
+# auto: macbox's metal2vulkan tuning with the macbox build; on; off
+MACBOX_GPU_TUNING=$MACBOX_GPU_TUNING
+# iOS Simulator pool: names are "<device> (<prefix> <label>)"
+MACBOX_SIM_PREFIX=$MACBOX_SIM_PREFIX
+MACBOX_POOL="$MACBOX_POOL"
+# T3 Code's Device panel
+MACBOX_T3_HOST_ID=$MACBOX_T3_HOST_ID
+MACBOX_T3_SETTINGS=$MACBOX_T3_SETTINGS
+EOF
+    say "config: $CONF (written; edit it before macbox create)"
+  fi
+  [ -f "$RUN/resolution" ] || echo "$MACBOX_RESOLUTION" >"$RUN/resolution"
+  [ -f "$RUN/mac" ] || printf '52:54:00:%02x:%02x:%02x\n' $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) >"$RUN/mac"
+  mkdir -p -m 700 "$HOME/.ssh"
+  [ -f "$KEY" ] || { ssh-keygen -q -t ed25519 -N "" -C "macbox@$(hostname -s)" -f "$KEY"; say "ssh key: $KEY"; }
+  local cfg="$HOME/.ssh/config" tmp
+  touch "$cfg"; chmod 600 "$cfg"
+  tmp=$(mktemp)
+  awk '/^# >>> macbox$/ {skip=1} !skip {print} /^# <<< macbox$/ {skip=0}' "$cfg" >"$tmp"
+  cat >>"$tmp" <<EOF
+# >>> macbox
+Host $MACBOX_SSH_HOST
+  HostName 127.0.0.1
+  Port $MACBOX_SSH_PORT
+  User $MACBOX_GUEST_USER
+  IdentityFile $KEY
+  IdentitiesOnly yes
+  UserKnownHostsFile ~/.ssh/known_hosts_macbox
+  StrictHostKeyChecking accept-new
+  ServerAliveInterval 30
+# <<< macbox
+EOF
+  cat "$tmp" >"$cfg"; rm -f "$tmp"
+  say "ssh: Host $MACBOX_SSH_HOST in ~/.ssh/config"
+  say "next: macbox doctor"
+}
+
+cmd_doctor() {
+  local bad=0 ok warnf
+  ok() { printf '  ok    %s\n' "$*"; }
+  warnf() { printf '  WARN  %s\n' "$*"; }
+  fail() { printf '  FAIL  %s\n' "$*"; bad=1; }
+  say "host"
+  [ "$(uname -m)" = x86_64 ] && ok "x86-64" || fail "$(uname -m): macbox needs an x86-64 host (macOS for Intel)"
+  grep -qwE 'vmx|svm' /proc/cpuinfo && ok "CPU virtualization (VT-x/AMD-V)" || fail "no vmx/svm flag: turn virtualization on in the firmware"
+  grep -qw avx2 /proc/cpuinfo && ok "AVX2" || fail "no AVX2: macOS 26 needs it"
+  [ -e /dev/kvm ] && { [ -r /dev/kvm ] && [ -w /dev/kvm ] && ok "/dev/kvm" || warnf "/dev/kvm exists but you can't open it (add yourself to its group, often kvm)"; } || fail "no /dev/kvm (load kvm_intel or kvm_amd)"
+  if [ -e "$MACBOX_RENDER_NODE" ]; then
+    local d vendor name
+    d="/sys/class/drm/$(basename "$MACBOX_RENDER_NODE")/device"
+    vendor=$(cat "$d/vendor" 2>/dev/null || echo ?)
+    case "$vendor" in
+      0x8086) name="Intel"; gpu_is_arl && name="Intel Arrow Lake (the GPU macbox is measured on)" ;;
+      0x1002) name="AMD (Reims supports it; macbox is untested there)"
+              { [ -r /dev/udmabuf ] && [ -w /dev/udmabuf ]; } || warnf "/dev/udmabuf isn't usable by you: AMD needs it (often the kvm group)" ;;
+      0x10de) name="NVIDIA (Reims supports it; macbox's image has no NVIDIA Vulkan driver yet)" ;;
+      *) name="vendor $vendor" ;;
+    esac
+    ok "GPU $MACBOX_RENDER_NODE: $name"
+    [ -r "$MACBOX_RENDER_NODE" ] || warnf "you can't open $MACBOX_RENDER_NODE (add yourself to its group, often render)"
+  else
+    fail "no $MACBOX_RENDER_NODE: set MACBOX_RENDER_NODE to your GPU's render node"
+  fi
+  local mem_mib need maps
+  mem_mib=$(( ${MACBOX_MEMORY%G} * 1024 ))
+  need=$(( mem_mib * 64 + 81920 )); maps=$(cat /proc/sys/vm/max_map_count)
+  [ "$maps" -ge "$need" ] && ok "vm.max_map_count $maps" ||
+    fail "vm.max_map_count is $maps; $MACBOX_MEMORY of guest RAM needs $need: sudo sysctl -w vm.max_map_count=2097152 (and a file in /etc/sysctl.d)"
+  local ram; ram=$(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo)
+  [ "$ram" -ge 16 ] && ok "RAM ${ram} GB" || warnf "RAM ${ram} GB: 16 GB or more is better"
+  mkdir -p "$MACBOX_HOME"
+  local free; free=$(df --output=avail -BG "$MACBOX_HOME" | tail -1 | tr -dc 0-9)
+  [ "$free" -ge 150 ] && ok "${free} GB free in $MACBOX_HOME" || warnf "${free} GB free in $MACBOX_HOME: macOS, Xcode and the build need about 150 (an SSD or NVMe helps a lot)"
+  if command -v "$DOCKER" >/dev/null && $DOCKER info >/dev/null 2>&1; then
+    ok "$DOCKER ($($DOCKER info --format '{{.ServerVersion}}' 2>/dev/null)$($DOCKER info 2>/dev/null | grep -q rootless && echo ', rootless'))"
+  else
+    fail "$DOCKER isn't usable (install Docker, or set MACBOX_DOCKER=podman)"
+  fi
+  say "macbox"
+  [ -f "$CONF" ] && ok "config $CONF" || fail "no config: macbox init"
+  [ -f "$KEY" ] && ok "ssh key" || fail "no ssh key: macbox init"
+  image_built && ok "image $MACBOX_IMAGE" || warnf "image not built: macbox build"
+  [ -x "$CHOME/.cargo/bin/reims-ctl" ] && [ -n "$(build_id)" ] && ok "Reims build $(build_id)" || warnf "Reims not built: macbox build"
+  vm_exists && ok "VM $MACBOX_VM" || warnf "no VM yet: macbox create"
+  if vm_running; then ok "VM running"; ssh_ok && ok "ssh $MACBOX_SSH_HOST" || warnf "ssh $MACBOX_SSH_HOST doesn't answer yet (macbox next)"
+  else warnf "VM not running"; fi
+  [ "$bad" = 0 ] || return 1
+}
+
+cmd_build() {
+  need_init
+  say "== image $MACBOX_IMAGE"
+  $DOCKER build -t "$MACBOX_IMAGE" "$REPO/docker"
+  local e; mapfile -t e < <(cenv)
+  say "== Reims vGPU, metal2vulkan and QEMU (20 to 60 minutes the first time)"
+  local pin=(); [ -n "${MACBOX_BUILD_CPUSET:-}" ] && pin=(taskset -c "$MACBOX_BUILD_CPUSET")
+  $DOCKER run --rm "${e[@]}" -v "$MACBOX_HOME:$MACBOX_HOME" -v "$REPO:$REPO:ro" "$MACBOX_IMAGE" \
+    "${pin[@]}" nice -n 10 bash "$REPO/container/build-reims.sh" "$@"
+  if vm_running; then say "the running VM keeps its QEMU; the new build starts with the next macbox down && macbox up"; fi
+}
+
+cmd_create() {
+  need_init
+  local macos=tahoe offline=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --macos) macos=$2; shift ;;
+      --offline) offline=(--offline) ;;
+      *) die "usage: macbox create [--macos tahoe|26|latest|26.6.2] [--offline]" ;;
+    esac
+    shift
+  done
+  vm_exists && die "the VM $MACBOX_VM exists already ($VMDIR)"
+  [ -n "$(build_id)" ] || die "no Reims build yet: macbox build"
+  container_start
+  say "== creating $MACBOX_VM: macOS $macos from Apple, $MACBOX_CPUS vCPUs, $MACBOX_MEMORY, a $MACBOX_DISK_SIZE disk"
+  ctl create "$MACBOX_VM" --macos "$macos" "${offline[@]}" --cpus "$MACBOX_CPUS" --memory "$MACBOX_MEMORY" \
+    --disk-size "$MACBOX_DISK_SIZE" --resolution "$(resolution)" --refresh "$MACBOX_REFRESH" \
+    --borderless true --audio false --logs true --ssh-port 0 --mac "$(cat "$RUN/mac")"
+  ctl set "$MACBOX_VM" --network false --extra-args "$(qemu_extra)" \
+    --video-acceleration=false --env SDL_VIDEO_DRIVER=wayland --env XDG_RUNTIME_DIR=/tmp/xdg --env REIMS_VGPU_STATS=1 >/dev/null
+  say "created. Next: macbox up, then open the screen and install macOS (macbox next shows each step)."
+}
+
+cmd_up() {
+  need_init
+  vm_exists || die "no VM yet: macbox create"
+  rm -f "$RUN/stopping"
+  container_start
+  local wd
+  if in_c test -S /tmp/host-wayland/wayland-0; then
+    wd=/tmp/host-wayland/wayland-0
+  else
+    wd=$(in_c "$REPO/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
+  fi
+  if ! vm_running; then
+    ctl set "$MACBOX_VM" --env "WAYLAND_DISPLAY=$wd" >/dev/null
+    apply_tuning
+    ctl start "$MACBOX_VM"
+  fi
+  local pid; pid=$(qemu_pid)
+  if [ -n "$MACBOX_CPUSET" ] && [ -n "$pid" ]; then
+    taskset -apc "$MACBOX_CPUSET" "$pid" >/dev/null 2>&1 || warn "couldn't pin QEMU to $MACBOX_CPUSET (taskset); it runs unpinned"
+  fi
+  if [ "$wd" = /tmp/host-wayland/wayland-0 ]; then say "macOS is up in a window on this desktop (click into it to capture the keyboard; Ctrl+Alt+Super releases it)"
+  else say "macOS is up. Screen: http://127.0.0.1:$MACBOX_SCREEN_PORT/ (local only; see docs/setup.md to reach it from elsewhere)"; fi
+  say "SSH: ssh $MACBOX_SSH_HOST (once Remote Login is on)"
+}
+
+cmd_down() {
+  touch "$RUN/stopping"
+  if vm_running; then
+    guest 'sudo -n shutdown -h now' >/dev/null 2>&1 || ctl stop "$MACBOX_VM" >/dev/null 2>&1 || true
+    local _
+    for _ in $(seq 60); do vm_running || break; sleep 2; done
+    vm_running && ctl stop "$MACBOX_VM" --force >/dev/null 2>&1 || true
+  fi
+  $DOCKER rm -f "$C" >/dev/null 2>&1 || true
+  say "macOS VM down"
+}
+
+cmd_status() {
+  if ! container_up; then say "container: stopped"; return 0; fi
+  say "container: running ($C)"
+  ctl list | sed 's/^/  /'
+  local pid; pid=$(qemu_pid)
+  [ -n "$pid" ] && ps -o pid,pcpu,rss,etime -p "$pid" | sed 's/^/  /'
+  in_c test -S /tmp/host-wayland/wayland-0 && say "  view: local (a window on the host's desktop)" ||
+    { say "  view: stream, http://127.0.0.1:$MACBOX_SCREEN_PORT/"; in_c "$REPO/container/stream-up.sh" status | sed 's/^/  /'; }
+  say "  build: $(build_id)$(tuning_on && echo ', GPU tuning on' || echo ', GPU tuning off')"
+  say "  screen: $(resolution)"
+  ssh_ok && say "  ssh $MACBOX_SSH_HOST: ok" || say "  ssh $MACBOX_SSH_HOST: no answer"
+}
+
+cmd_next() {  # where the setup stands, and the next step
+  local step
+  step() { printf '  [%s] %s\n' "$1" "$2"; }
+  [ -f "$CONF" ] || { step " " "macbox init"; return; }; step x "config"
+  image_built && [ -n "$(build_id)" ] || { step " " "macbox build"; return; }; step x "build $(build_id)"
+  vm_exists || { step " " "macbox create"; return; }; step x "VM $MACBOX_VM"
+  vm_running || { step " " "macbox up"; return; }; step x "running"
+  if ! ssh_ok; then
+    step " " "install macOS and turn on SSH, in the VM's screen (docs/setup.md, steps 5 to 8):"
+    say "        1. Disk Utility: erase \"QEMU HARDDISK Media\" as APFS; quit it; Reinstall macOS (30 to 60 min)."
+    say "        2. Before the first desktop, set Metal's error mode from Recovery: macbox boot-picker on,"
+    say "           restart into the Recovery entry, open Utilities > Terminal, then: macbox recovery-fix"
+    say "        3. Setup Assistant: an admin user named $MACBOX_GUEST_USER, no Apple Account needed."
+    say "        4. In the desktop, open Terminal, then: macbox ssh-bootstrap"
+    say "        An agent can do all of it with macbox screenshot / click / type / key."
+    return
+  fi
+  step x "ssh $MACBOX_SSH_HOST"
+  guest 'test -x ~/.macbox/macbox-guest' 2>/dev/null || { step " " "macbox provision"; return; }
+  guest '~/.macbox/macbox-guest doctor' 2>/dev/null | sed 's/^/        /' || true
+  guest 'xcode-select -p 2>/dev/null | grep -q Xcode.app' || { step " " "macbox xcode <Xcode_*.xip downloaded from developer.apple.com>"; return; }
+  step x "Xcode"
+  guest '~/.macbox/macbox-guest pool list' >/dev/null 2>&1 && step x "simulator pool" || { step " " "macbox pool"; return; }
+  grep -q "\"id\": *\"$MACBOX_T3_HOST_ID\"" "$MACBOX_T3_SETTINGS" 2>/dev/null && step x "T3 Code device host" || step " " "macbox t3 register (if you use T3 Code)"
+  command -v mac-sim >/dev/null && step x "agent tools" || step " " "macbox agents install"
+}
+
+cmd_gui() {  # screenshot / click / type / key / scroll / wait, through QMP in the container
+  container_up || die "the container isn't running: macbox up"
+  local sub=$1; shift
+  local e=(-e "VM_QMP=$VMDIR/qmp.sock" -e "VM_RESOLUTION_FILE=$RUN/resolution" -e "VM_SHOTS=$MACBOX_HOME/shots")
+  mkdir -p "$MACBOX_HOME/shots"
+  case "$sub" in
+    shot|wait)
+      local out="${1:-$MACBOX_HOME/shots/screen.png}" tmp="$MACBOX_HOME/shots/.shot-$$.png"
+      if [ "$sub" = wait ]; then $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" wait "${2:-60}" "$tmp"
+      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" shot "$tmp"; fi
+      mv -f "$tmp" "$out"; say "$out" ;;
+    type)
+      if [ "${1:-}" = - ]; then $DOCKER exec -i "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" type -
+      else $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" type "$@"; fi ;;
+    *) $DOCKER exec "${e[@]}" "$C" python3 "$REPO/lib/vmctl.py" "$sub" "$@" ;;
+  esac
+}
+
+cmd_recovery_fix() {  # types the METAL_ERROR_MODE line into Recovery's Terminal (focused)
+  say "typing into the VM: the Metal error-mode line (Recovery > Utilities > Terminal must be in front)"
+  printf '%s\n' 'cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot' |
+    cmd_gui type -
+  cmd_gui key ret
+  say "the VM restarts if every step worked; then pick macOS in the picker (macbox boot-picker off hides it again)"
+}
+
+cmd_ssh_bootstrap() {  # types into the desktop's Terminal: this host's key, then Remote Login on
+  [ -f "$KEY.pub" ] || die "no key: macbox init"
+  local line
+  line="mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$(cat "$KEY.pub")' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && sudo launchctl enable system/com.openssh.sshd; sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; echo macbox-ssh-done"
+  say "typing into the VM's Terminal (it must be in front): the SSH key, then Remote Login on; sudo asks for $MACBOX_GUEST_USER's password there"
+  printf '%s\n' "$line" | cmd_gui type -
+  cmd_gui key ret
+  say "type the password in the VM (or: macbox type - <<<'password', then macbox key ret). Then: ssh $MACBOX_SSH_HOST true"
+  say "if Remote Login stays off: System Settings > General > Sharing > Remote Login"
+}
+
+cmd_provision() {
+  ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer: macbox next"
+  [ -x "$REPO/guest/macbox-guest" ] || die "guest/macbox-guest is missing from this checkout"
+  say "== copying guest/ to ~/.macbox on the Mac"
+  guest 'mkdir -p ~/.macbox'
+  tar -C "$REPO/guest" -cf - . | guest 'tar -C ~/.macbox -xf -'
+  # The guest side's settings (macbox-guest reads ~/.macbox/config.env).
+  printf 'MACBOX_SIM_PREFIX=%q\nMACBOX_POOL=%q\n' "$MACBOX_SIM_PREFIX" "$MACBOX_POOL" | guest 'cat > ~/.macbox/config.env'
+  local subs=("$@"); [ ${#subs[@]} -gt 0 ] || subs=(base tools "stream-settings install")
+  local s
+  for s in "${subs[@]}"; do
+    say "== macbox-guest $s"
+    if [ "$s" = base ]; then ssh -t "$MACBOX_SSH_HOST" "~/.macbox/macbox-guest base"
+    else guest "~/.macbox/macbox-guest $s"; fi
+  done
+}
+
+cmd_xcode() {
+  local xip=${1:-}
+  ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"
+  if [ -z "$xip" ]; then guest '~/.macbox/macbox-guest xcode status'; return; fi
+  [ -f "$xip" ] || die "no file $xip (download Xcode's .xip from https://developer.apple.com/download/all/, signed in with any Apple Account)"
+  local name; name=$(basename "$xip")
+  say "== copying $name to the Mac"
+  # Not ~/Downloads: over SSH, macOS keeps it private unless "Allow full disk access for remote users" is on.
+  guest 'mkdir -p ~/.macbox/downloads'
+  scp -q "$xip" "$MACBOX_SSH_HOST:.macbox/downloads/$name"
+  guest "~/.macbox/macbox-guest xcode ~/.macbox/downloads/$(printf '%q' "$name")"
+  guest '~/.macbox/macbox-guest runtime'
+}
+
+cmd_disk() {  # the system disk on NVMe (faster) once macOS is installed
+  case "${1:-}" in
+    nvme|ahci)
+      vm_running && die "the VM is running: macbox down first"
+      container_start
+      [ "$1" = nvme ] && { ctl eject "$MACBOX_VM" >/dev/null 2>&1 || true; }
+      ctl set "$MACBOX_VM" --disk-controller "$1"
+      say "the system disk is on $1 from the next macbox up" ;;
+    *) die "usage: macbox disk nvme|ahci" ;;
+  esac
+}
+
+cmd_t3() {
+  local sub=${1:-status}
+  case "$sub" in
+    register|unregister|status)
+      python3 - "$sub" "$MACBOX_T3_SETTINGS" "$MACBOX_T3_HOST_ID" "$MACBOX_SSH_HOST" <<'EOF'
+import json, os, shutil, sys, time
+sub, path, hid, target = sys.argv[1:]
+try:
+    s = json.load(open(path))
+except FileNotFoundError:
+    if sub != "register": print("no T3 Code settings at", path); sys.exit(0)
+    s = {}
+hosts = s.setdefault("deviceHosts", [])
+mine = [h for h in hosts if h.get("id") == hid]
+if sub == "status":
+    print("T3 device host:", json.dumps(mine[0]) if mine else "not registered"); sys.exit(0)
+if sub == "register":
+    entry = {"kind": "ssh", "id": hid, "label": f"macbox ({target})", "target": target}
+    if mine == [entry]: print("T3 device host", hid, "already registered"); sys.exit(0)
+    hosts[:] = [h for h in hosts if h.get("id") != hid] + [entry]
+else:
+    if not mine: print("not registered"); sys.exit(0)
+    hosts[:] = [h for h in hosts if h.get("id") != hid]
+if os.path.exists(path): shutil.copy2(path, f"{path}.bak-macbox-{time.strftime('%Y%m%d-%H%M%S')}")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+json.dump(s, open(tmp, "w"), indent=2); os.replace(tmp, path)
+print(("registered" if sub == "register" else "removed"), "T3 device host", hid, "->", "ssh", target, "in", path)
+EOF
+      [ "$sub" = register ] && say "T3 reloads it by itself. Open the Device panel once (T3 installs its device hub on the Mac), then: macbox t3 fix-hub" || true ;;
+    fix-hub) ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"; guest "~/.macbox/macbox-guest t3-hub ${2:-}" ;;
+    *) die "usage: macbox t3 register|unregister|status|fix-hub [version]" ;;
+  esac
+}
+
+cmd_agents() {
+  local sub=${1:-install} bin="$HOME/.local/bin" f n
+  case "$sub" in
+    install)
+      mkdir -p "$bin"
+      for f in "$REPO"/sims/bin/* "$REPO"/skills/*/bin/*; do [ -f "$f" ] && ln -sfn "$f" "$bin/$(basename "$f")"; done
+      ln -sfn "$REPO/macbox" "$bin/macbox"
+      for d in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+        mkdir -p "$d"
+        for f in "$REPO"/skills/*/; do
+          n=$(basename "$f")
+          if [ -e "$d/$n" ] && [ ! -L "$d/$n" ]; then warn "$d/$n exists and isn't macbox's link; left as it is"; continue; fi
+          ln -sfn "${f%/}" "$d/$n"
+        done
+      done
+      if [ -d "$REPO/sims/systemd" ] && command -v systemctl >/dev/null; then
+        mkdir -p "$HOME/.config/systemd/user"
+        for f in "$REPO"/sims/systemd/*; do ln -sfn "$f" "$HOME/.config/systemd/user/$(basename "$f")"; done
+        systemctl --user daemon-reload
+        systemctl --user enable --now mac-sim-idle.timer >/dev/null 2>&1 || warn "couldn't enable mac-sim-idle.timer"
+      fi
+      # The "Simulators" section, between its markers, into the agents' global instructions.
+      for f in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md"; do
+        [ -d "$(dirname "$f")" ] || continue
+        [ -f "$f" ] && cp -p "$f" "$f.bak-macbox"
+        python3 - "$f" "$REPO/agents/simulators-snippet.md" <<'PY'
+import re, sys
+path, snip = sys.argv[1], open(sys.argv[2]).read().strip() + "\n"
+try: old = open(path).read()
+except FileNotFoundError: old = ""
+pat = re.compile(r"<!-- macbox:simulators begin -->.*?<!-- macbox:simulators end -->\n?", re.S)
+new = pat.sub(lambda m: snip, old) if pat.search(old) else (old.rstrip("\n") + "\n\n" if old.strip() else "") + snip
+open(path, "w").write(new)
+PY
+        say "instructions: the Simulators section in $f"
+      done
+      say "linked: $(ls "$REPO/sims/bin" "$REPO"/skills/*/bin 2>/dev/null | grep -v -e : -e '^$' | tr '\n' ' ')macbox -> $bin"
+      say "skills: $(ls "$REPO/skills" | tr '\n' ' ')-> ~/.claude/skills, ~/.agents/skills"
+      say "Claude Code hook (optional): agents/README.md" ;;
+    uninstall)
+      for f in "$REPO"/sims/bin/* "$REPO"/skills/*/bin/* "$REPO/macbox"; do n=$(basename "$f"); [ "$(readlink "$bin/$n" 2>/dev/null)" = "$f" ] && rm -f "$bin/$n"; done
+      for d in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+        for f in "$REPO"/skills/*/; do n=$(basename "$f"); [ "$(readlink "$d/$n" 2>/dev/null)" = "${f%/}" ] && rm -f "$d/$n"; done
+      done
+      if [ -d "$REPO/sims/systemd" ] && command -v systemctl >/dev/null; then
+        systemctl --user disable --now mac-sim-idle.timer >/dev/null 2>&1 || true
+        for f in "$REPO"/sims/systemd/*; do n=$(basename "$f"); [ "$(readlink "$HOME/.config/systemd/user/$n" 2>/dev/null)" = "$f" ] && rm -f "$HOME/.config/systemd/user/$n"; done
+        systemctl --user daemon-reload
+      fi
+      say "removed macbox's links" ;;
+    *) die "usage: macbox agents install|uninstall" ;;
+  esac
+}
+
+cmd_backup() {
+  local name=${1:?usage: macbox backup <name>} b="$MACBOX_HOME/backups/$1" disk
+  vm_running && die "the VM is running: macbox down first"
+  disk=$(readlink -f "$VMDIR/$(sed -n 's/^disk = "\(.*\)"/\1/p' "$VMDIR/vm.toml")")
+  [ -e "$b" ] && die "$b exists"
+  mkdir -p "$b"
+  cp --reflink=auto --sparse=always "$disk" "$b/$(basename "$disk")"
+  cp -p "$VMDIR"/{OVMF_VARS.fd,vm.toml} "$b/"
+  cp -p "$VMDIR"/opencore.* "$b/" 2>/dev/null || true
+  build_id >"$b/qemu-current"
+  say "backup: $b (restore: macbox down, copy the files back into $VMDIR)"
+}
+
+cmd_help() {
+  cat <<EOF
+macbox: a full macOS VM with GPU acceleration, Xcode, iOS Simulators and T3 Code, on Linux + Docker
+
+Setup (docs/setup.md):
+  macbox init                 config ($CONF), an SSH key and the ssh alias $MACBOX_SSH_HOST
+  macbox doctor               check the host
+  macbox build [--upstream]   the image, then Reims vGPU + metal2vulkan + QEMU (patched; --upstream: as upstream)
+  macbox create [--macos tahoe] [--offline]   a new VM; macOS downloads from Apple
+  macbox next                 where the setup stands, and the next step
+  macbox recovery-fix         type the Metal error-mode line into Recovery's Terminal
+  macbox boot-picker on|off   OpenCore's boot picker (to reach Recovery)
+  macbox ssh-bootstrap        type the SSH key + Remote Login line into the desktop's Terminal
+  macbox provision [step...]  copy guest/ to the Mac and run it (default: base tools stream-settings)
+  macbox xcode <file.xip>     install Xcode and the iOS Simulator runtime
+  macbox disk nvme            the system disk on NVMe (faster), once macOS is installed
+  macbox pool [create|list|delete]   the iOS Simulator pool
+  macbox t3 register|status|unregister|fix-hub   T3 Code's Device panel
+  macbox agents install|uninstall    mac-sim, sim-fps, android-sim, the skills, the idle timer
+
+Day to day:
+  macbox up | down | status | logs [qemu|selkies|sway]
+  macbox view local|stream    the VM's window on this desktop, or in the browser stream
+  macbox stream selkies|novnc
+  macbox resolution WxH       macOS's screen size (restarts a running VM)
+  macbox ssh [command]
+  macbox screenshot [out.png] | click X Y [right|double] | move X Y | scroll X Y N
+  macbox type TEXT|-  |  key COMBO...  |  wait SECONDS [out.png]
+  macbox backup <name>
+EOF
+}
+
+sub=${1:-help}; [ $# -gt 0 ] && shift
+case "$sub" in
+  init) cmd_init ;;
+  doctor) cmd_doctor ;;
+  build) cmd_build "$@" ;;
+  create) cmd_create "$@" ;;
+  up) cmd_up ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  next) cmd_next ;;
+  logs)
+    case "${1:-qemu}" in
+      qemu) tail -n "${2:-50}" "$VMDIR/logs/qemu.log" ;;
+      *) tail -n "${2:-50}" "$LOGS/$1.log" ;;
+    esac ;;
+  view)
+    case "${1:-}" in
+      "") say "view: $(view)" ;;
+      local|stream) echo "$1" >"$RUN/view"; if container_up; then cmd_down; cmd_up; fi ;;
+      *) die "usage: macbox view [local|stream]" ;;
+    esac ;;
+  stream) container_up || die "the container isn't running"; in_c "$REPO/container/stream-up.sh" "${1:-status}" ;;
+  resolution)
+    [[ "${1:-}" =~ ^[0-9]+x[0-9]+$ ]] || die "usage: macbox resolution WIDTHxHEIGHT"
+    echo "$1" >"$RUN/resolution"
+    if vm_running; then cmd_down; container_start; ctl set "$MACBOX_VM" --resolution "$1" >/dev/null; cmd_up
+    elif container_up; then ctl set "$MACBOX_VM" --resolution "$1" >/dev/null
+    else say "applies at the next macbox up"; fi ;;
+  ssh) exec ssh "$MACBOX_SSH_HOST" "$@" ;;
+  screenshot) cmd_gui shot "$@" ;;
+  click|move|scroll|type|key) cmd_gui "$sub" "$@" ;;
+  wait) cmd_gui wait "${2:-}" "${1:-60}" ;;
+  recovery-fix) cmd_recovery_fix ;;
+  boot-picker)
+    case "${1:-}" in
+      on) container_start; ctl update-opencore "$MACBOX_VM" --boot-selection ;;
+      off) container_start; ctl update-opencore "$MACBOX_VM" --boot-selection=false ;;
+      *) die "usage: macbox boot-picker on|off" ;;
+    esac ;;
+  ssh-bootstrap) cmd_ssh_bootstrap ;;
+  provision) cmd_provision "$@" ;;
+  xcode) cmd_xcode "$@" ;;
+  disk) cmd_disk "$@" ;;
+  pool) ssh_ok || die "ssh $MACBOX_SSH_HOST doesn't answer"; guest "MACBOX_SIM_PREFIX=$(printf '%q' "$MACBOX_SIM_PREFIX") MACBOX_POOL=$(printf '%q' "$MACBOX_POOL") ~/.macbox/macbox-guest pool ${1:-create}" ;;
+  t3) cmd_t3 "$@" ;;
+  agents) cmd_agents "$@" ;;
+  backup) cmd_backup "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help >&2; exit 2 ;;
+esac

@@ -1,0 +1,94 @@
+From c7c4784cc0e261d58ddfb3f650f70401e8abc13b Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 15:48:23 +0000
+Subject: [PATCH 1/5] env-gated Arrow Lake-S facts and
+ deviations (M2V_ARL_FACTS)
+
+---
+ .../metal2vulkan/src/device/driver_facts.rs   | 59 ++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
+index 26020bce..36e1d7a6 100644
+--- a/crates/metal2vulkan/src/device/driver_facts.rs
++++ b/crates/metal2vulkan/src/device/driver_facts.rs
+@@ -661,6 +661,61 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
+ /// `intel-irisxe-rplp-anv`).
+ pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
+ 
++/// macbox: the `deviceID` of the Intel Graphics of Arrow Lake-S (Xe-LPG). Every fact and
++/// deviation any Intel row names applies to it only while `M2V_ARL_FACTS` names it
++/// ([`arl_gate`]): a comma list of `DriverFact` and `DriverDeviation` names, or `all`. Unset,
++/// it takes none, as a GPU no row names.
++pub(crate) const INTEL_ARL_S: u32 = 0x7d67;
++
++/// macbox: the device-specific facts measured on Raptor Lake's ANV that Arrow Lake-S may
++/// take, each only as `M2V_ARL_FACTS` names it (the Intel rows of every vendor stay in `MEASURED`).
++const ARL_FACTS: &[DriverFact] = &[
++    DriverFact::RobustIndexFetchReadsZero,
++    DriverFact::SampledFetchRecoversCodes,
++    DriverFact::InterlockedPassSplitNoSlower,
++    DriverFact::DontCareStoreIsOneOfMetals,
++    DriverFact::Bc6hBlockDecodeIsMetals,
++    DriverFact::Bc7BlockDecodeIsMetals,
++    DriverFact::ShadowCopyInDispatchFaster,
++    DriverFact::SubmissionsWithoutSignalsMerge,
++    DriverFact::SampledDepthKeepsHiZ,
++    DriverFact::MultisampledDepthFasterOutOfGeneral,
++    DriverFact::PointerImportsFollowTheirAddress,
++    DriverFact::InterlockOrdersDraws,
++];
++
++/// macbox: the deviations measured on Raptor Lake's ANV that Arrow Lake-S may take, each
++/// only as `M2V_ARL_FACTS` names it.
++const ARL_DEVIATIONS: &[DriverDeviation] = &[
++    DriverDeviation::MetalFloatDenormals,
++    DriverDeviation::MetalSmallFloatColorWrites,
++    DriverDeviation::MetalHalfStorageWrites,
++    DriverDeviation::MetalDepth16Stores,
++];
++
++/// macbox: whether `M2V_ARL_FACTS` names `name` (a `Debug` name) or `all`.
++pub(crate) fn arl_named(name: &str) -> bool {
++    let Ok(list) = std::env::var("M2V_ARL_FACTS") else { return false };
++    list.split(',').map(str::trim).any(|n| n == "all" || n == name)
++}
++
++/// macbox: on Arrow Lake-S under ANV, `set` plus `extra`, kept only as `M2V_ARL_FACTS`
++/// names each; elsewhere `set` as it is.
++fn arl_gate<F: Copy + Ord + std::fmt::Debug>(
++    description: &DeviceDescription,
++    mut set: BTreeSet<F>,
++    extra: &[F],
++) -> BTreeSet<F> {
++    let arl = description.driver_id == Some(DriverId::INTEL_OPEN_SOURCE_MESA)
++        && identity(description) == (INTEL_VENDOR_ID, INTEL_ARL_S);
++    if !arl {
++        return set;
++    }
++    set.extend(extra.iter().copied());
++    set.retain(|f| arl_named(&format!("{f:?}")));
++    set
++}
++
+ /// The row of `fact` measured on Mesa's `driver` on the GPU `(vendor, device)`.
+ const fn mesa_on<F>(fact: F, driver: DriverId, (vendor, device): (u32, u32)) -> Measured<F> {
+     Measured {
+@@ -808,7 +863,7 @@ pub(crate) fn defects(description: &DeviceDescription) -> BTreeSet<DriverWorkaro
+ 
+ /// The deviations of the driver `description` names, on its GPU.
+ pub(crate) fn deviations(description: &DeviceDescription) -> BTreeSet<DriverDeviation> {
+-    among(DEVIATIONS, description.driver_id, identity(description))
++    arl_gate(description, among(DEVIATIONS, description.driver_id, identity(description)), ARL_DEVIATIONS)
+ }
+ 
+ /// The `vendorID` and the `deviceID` the tables name `description`'s GPU by.
+@@ -2253,7 +2308,7 @@ impl DeviceDescription {
+     /// The runtime's driver facts ([`DriverFact`]) of the device this description names: those
+     /// its driver's rows name, on its vendor and GPU, at any release.
+     pub fn driver_facts(&self) -> BTreeSet<DriverFact> {
+-        among(MEASURED, self.driver_id, identity(self))
++        arl_gate(self, among(MEASURED, self.driver_id, identity(self)), ARL_FACTS)
+     }
+ 
+     /// The formats the device lists as color attachments of optimal tiling without

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""sim-fps: the frame rate of a simulator recording, stretch by stretch.
+
+    sim-fps <recording.mp4> [--still-ms 250]
+
+Simulators (mac-sim record, android-sim record) write a frame only when the screen changes,
+so a recording is a few stretches of motion separated by stills. For each stretch this prints
+its frames per second, its longest gap between frames and the frames it dropped (a gap of more
+than 1.5 frames at 60 Hz). A gap longer than --still-ms (default 250) ends a stretch: either the
+screen stood still or the app froze that long. Look at the frames around it to tell which.
+Exit status: 0 when every stretch of 5 or more frames held 60 fps with no dropped frames, 1
+when one didn't, 2 on bad input.
+"""
+import json, subprocess, sys
+
+FRAME = 1 / 60
+
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    still = 0.25
+    if "--still-ms" in argv:
+        still = float(argv[argv.index("--still-ms") + 1]) / 1000
+        args.remove(argv[argv.index("--still-ms") + 1])
+    if len(args) != 1:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    path = args[0]
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "frame=best_effort_timestamp_time", "-of", "json", path],
+            capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"sim-fps: can't read {path}: {getattr(e, 'stderr', '') or e}", file=sys.stderr)
+        return 2
+    ts = sorted(float(f["best_effort_timestamp_time"]) for f in json.loads(out).get("frames", [])
+                if f.get("best_effort_timestamp_time") not in (None, "N/A"))
+    if len(ts) < 2:
+        print(f"{path}: {len(ts)} frame(s); nothing moved while it recorded")
+        return 1
+    print(f"{path}: {len(ts)} frames over {ts[-1] - ts[0]:.2f} s")
+    stretches, cur = [], [ts[0]]
+    for a, b in zip(ts, ts[1:]):
+        if b - a > still:
+            stretches.append(cur)
+            print(f"  still or frozen {a:.2f}-{b:.2f} s ({(b - a) * 1000:.0f} ms)")
+            cur = []
+        cur.append(b)
+    stretches.append(cur)
+    ok = True
+    for s in stretches:
+        if len(s) < 5:
+            continue
+        gaps = [b - a for a, b in zip(s, s[1:])]
+        dur = s[-1] - s[0]
+        fps = (len(s) - 1) / dur if dur > 0 else 0
+        drops = [(a, round(g / FRAME) - 1) for a, g in zip(s, gaps) if g > 1.5 * FRAME]
+        missed = sum(n for _, n in drops)
+        held = fps >= 57 and missed == 0
+        ok &= held
+        where = ", ".join(f"{t:.2f}s" for t, _ in drops[:8]) + (" ..." if len(drops) > 8 else "")
+        print(f"  motion {s[0]:.2f}-{s[-1]:.2f} s: {len(s)} frames, {fps:.1f} fps, "
+              f"longest gap {max(gaps) * 1000:.0f} ms, {missed} dropped"
+              + (f" (after {where})" if drops else "") + ("" if held else "  <-- below 60"))
+    print("60 fps held in every stretch" if ok else "not 60 fps: look at the frames around the drops")
+    return 0 if ok else 1
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,679 @@
+From 4d7bde28d0e2369d3a6c5f871ddaf84456bd5290 Mon Sep 17 00:00:00 2001
+From: macbox <macbox@localhost>
+Date: Wed, 28 Oct 2026 17:00:38 +0000
+Subject: [PATCH 3/5] live experiment switches (M2V_LIVE):
+ driver facts and heap compression change without a restart
+
+---
+ .../metal2vulkan-runtime/src/color_resolve.rs |   3 +-
+ .../src/command_buffer/group.rs               |   3 +-
+ .../metal2vulkan-runtime/src/degradation.rs   |   5 +-
+ crates/metal2vulkan-runtime/src/depth_copy.rs |   5 +-
+ .../src/framebuffer_fetch.rs                  |   3 +-
+ .../src/host_residency.rs                     |   3 +-
+ crates/metal2vulkan-runtime/src/image_plan.rs |   9 +-
+ crates/metal2vulkan-runtime/src/lib.rs        |   2 +
+ crates/metal2vulkan-runtime/src/live.rs       | 129 ++++++++++++++++++
+ .../metal2vulkan-runtime/src/mipmap_filter.rs |   3 +-
+ .../src/pipeline/render/residual.rs           |   3 +-
+ crates/metal2vulkan-runtime/src/render.rs     |   5 +-
+ .../src/render/unused_bits_load.rs            |   3 +-
+ .../metal2vulkan-runtime/src/render_pass.rs   |   5 +-
+ .../metal2vulkan-runtime/src/render_target.rs |   7 +-
+ crates/metal2vulkan-runtime/src/row_copies.rs |   3 +-
+ .../src/shadow_copy_back.rs                   |   5 +-
+ crates/metal2vulkan-runtime/src/texture.rs    |   5 +-
+ .../metal2vulkan-runtime/src/texture/heap.rs  |  15 +-
+ .../src/texture/held_depth.rs                 |   3 +-
+ crates/metal2vulkan-runtime/src/word_fill.rs  |   3 +-
+ 21 files changed, 188 insertions(+), 34 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/live.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/color_resolve.rs b/crates/metal2vulkan-runtime/src/color_resolve.rs
+index fb683618..ec9acf03 100644
+--- a/crates/metal2vulkan-runtime/src/color_resolve.rs
++++ b/crates/metal2vulkan-runtime/src/color_resolve.rs
+@@ -88,6 +88,7 @@
+ //! runtime announces `shader-resolve` (performance) for the extra pass (naming the copy where the
+ //! resolve reads one), and `unmeasured-resolve` (precision) at more than 4 samples.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::binding_view::{views_as, VkView};
+ use super::blit::TRANSFER;
+ use super::command_buffer::CommandBuffer;
+@@ -128,7 +129,7 @@ pub(super) fn average_is_metals(device: &Device, samples: u32) -> bool {
+         && device
+             .properties()
+             .driver_facts
+-            .contains(&DriverFact::ColorResolveAverageIsMetals)
++            .live_has(DriverFact::ColorResolveAverageIsMetals)
+ }
+ 
+ /// The resolve of a multisampled color attachment of the extended-range format `pf`, held in its
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/group.rs b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+index 78c7b052..dc2c7a37 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/group.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/group.rs
+@@ -79,6 +79,7 @@
+ //!   keeps with their room: the scheduler thread allocates nothing for it
+ //!   (`runtime_lane::frame_costs`, `a_frame_s_commits_allocate_within_their_bound`).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::submit::Submission;
+ use super::{submission_error, CommandBufferShared};
+ use crate::degradation::Degradation;
+@@ -179,7 +180,7 @@ const WAITED_FOR: u8 = 2;
+ /// it, and nothing of the driver's identity, so a test can hand it the facts of each committed
+ /// profile (`tests::batches::only_drivers_measured_to_merge_their_submissions_group_their_batches`).
+ pub(crate) fn merges_submissions(facts: &BTreeSet<DriverFact>) -> bool {
+-    facts.contains(&DriverFact::SubmissionsWithoutSignalsMerge)
++    facts.live_has(DriverFact::SubmissionsWithoutSignalsMerge)
+ }
+ 
+ /// What sent a group held (`WorkCounts::group_ends_full` and kin).
+diff --git a/crates/metal2vulkan-runtime/src/degradation.rs b/crates/metal2vulkan-runtime/src/degradation.rs
+index 3b97ede6..a0fbce2a 100644
+--- a/crates/metal2vulkan-runtime/src/degradation.rs
++++ b/crates/metal2vulkan-runtime/src/degradation.rs
+@@ -53,6 +53,7 @@
+ //!   texels the device decodes otherwise than Metal where the device makes it (`texture.rs`,
+ //!   `texture/shared.rs`, `texture/heap.rs`).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::attachment_stand_in::{Cause, StandIn};
+ use super::color_resolve;
+ use super::device::{DebugMessage, Device, MessageKind, MessageSeverity};
+@@ -4117,7 +4118,7 @@ impl HandedToMetal {
+     ) -> Option<Self> {
+         let facts = &device.properties().driver_facts;
+         whole
+-            .filter(|_| facts.contains(&DriverFact::DontCareStoreIsMetals))
++            .filter(|_| facts.live_has(DriverFact::DontCareStoreIsMetals))
+             .map(|whole| HandedToMetal {
+                 handed: render_target::handed_dont_care(device, layout, whole.shape),
+                 drew: whole.drew,
+@@ -4253,7 +4254,7 @@ impl Device {
+         let split_form = self
+             .properties()
+             .driver_facts
+-            .contains(&DriverFact::InterlockedPassSplitNoSlower);
++            .live_has(DriverFact::InterlockedPassSplitNoSlower);
+         let storage_alone = |pair: &[S]| {
+             let (a, b) = (of(&pair[0]), of(&pair[1]));
+             a.storage != b.storage
+diff --git a/crates/metal2vulkan-runtime/src/depth_copy.rs b/crates/metal2vulkan-runtime/src/depth_copy.rs
+index b749a897..184d2cdd 100644
+--- a/crates/metal2vulkan-runtime/src/depth_copy.rs
++++ b/crates/metal2vulkan-runtime/src/depth_copy.rs
+@@ -59,6 +59,7 @@
+ //! device; a copy's descriptor set and framebuffer are its own, held by its command buffer until
+ //! it completes.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::binding_view::VkView;
+ use super::degradation::Degradation;
+ use super::device::{device_error, lock};
+@@ -116,8 +117,8 @@ pub(super) fn copies_exactly(device: &Device, format: Format) -> bool {
+ 
+ /// [`copies_exactly`] on a driver with `facts`.
+ fn copies_exactly_by(facts: &BTreeSet<DriverFact>, format: Format) -> bool {
+-    (float_depth(format) && facts.contains(&DriverFact::FragmentDepthStoresUnchanged))
+-        || (unorm16_depth(format) && facts.contains(&DriverFact::FragmentDepthKeepsDepth16Codes))
++    (float_depth(format) && facts.live_has(DriverFact::FragmentDepthStoresUnchanged))
++        || (unorm16_depth(format) && facts.live_has(DriverFact::FragmentDepthKeepsDepth16Codes))
+ }
+ 
+ /// What the draw does to a depth aspect it writes.
+diff --git a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+index 59062a3d..5c24c7e0 100644
+--- a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
++++ b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+@@ -90,6 +90,7 @@
+ //! image or backing that has it, which an image copy fills and empties at the same sample count
+ //! (`attachment_stand_in.rs`).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::color_resolve;
+ use super::depth_stencil_scratch;
+ use super::device::lock;
+@@ -432,7 +433,7 @@ impl Device {
+         texture_type: TextureType,
+     ) -> Result<ImagePlan, Error> {
+         let keeps_hiz =
+-            (self.properties().driver_facts).contains(&DriverFact::SampledDepthKeepsHiZ);
++            (self.properties().driver_facts).live_has(DriverFact::SampledDepthKeepsHiZ);
+         let plan = match hiz_candidate(&plan, self.compile_device().profile(), keeps_hiz) {
+             Some(candidate) => self.if_made(plan, candidate, texture_type)?,
+             None => plan,
+diff --git a/crates/metal2vulkan-runtime/src/host_residency.rs b/crates/metal2vulkan-runtime/src/host_residency.rs
+index fd889f83..64dca27b 100644
+--- a/crates/metal2vulkan-runtime/src/host_residency.rs
++++ b/crates/metal2vulkan-runtime/src/host_residency.rs
+@@ -79,6 +79,7 @@
+ //!   did not fit); the device's dma-buf memories (`dma_buf_memories_live`) and its
+ //!   imports of host pages by their pointer (`host_imports_live`) fall as imports are released.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::buffer::{FixedPages, HostImport, Imported, Pages, Shape};
+ use super::device::lock;
+ use super::dma_buf::{DmaBufRequest, DmaBufSource};
+@@ -220,7 +221,7 @@ impl Again {
+         (length, window, class): (u64, ImportWindow, MemoryClass),
+     ) -> Option<Again> {
+         let follows = (device.properties().driver_facts)
+-            .contains(&DriverFact::PointerImportsFollowTheirAddress);
++            .live_has(DriverFact::PointerImportsFollowTheirAddress);
+         follows.then(|| Again {
+             device: device.clone(),
+             from: AgainFrom::Pointer(ImportedAt(pointer)),
+diff --git a/crates/metal2vulkan-runtime/src/image_plan.rs b/crates/metal2vulkan-runtime/src/image_plan.rs
+index f3b4901f..13e3c7b4 100644
+--- a/crates/metal2vulkan-runtime/src/image_plan.rs
++++ b/crates/metal2vulkan-runtime/src/image_plan.rs
+@@ -48,6 +48,7 @@
+ //! The device's image limits for the result (`vkGetPhysicalDeviceImageFormatProperties2`) are
+ //! checked by [`check_image_limits`].
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::chroma_pairs::plan_pairs;
+ use super::framebuffer_fetch;
+ use super::memory::MemoryClass;
+@@ -115,10 +116,10 @@ impl DepthImageFacts {
+     /// The depth-image facts among a driver's `facts`.
+     pub(super) fn of(facts: &BTreeSet<DriverFact>) -> DepthImageFacts {
+         DepthImageFacts {
+-            denormals: facts.contains(&DriverFact::DepthImageKeepsDenormals),
+-            outside_unit_range: facts.contains(&DriverFact::DepthImageKeepsValuesOutsideUnitRange),
+-            test_denormals: facts.contains(&DriverFact::DepthTestKeepsDenormals),
+-            test_magnitudes: facts.contains(&DriverFact::DepthTestComparesMagnitudes),
++            denormals: facts.live_has(DriverFact::DepthImageKeepsDenormals),
++            outside_unit_range: facts.live_has(DriverFact::DepthImageKeepsValuesOutsideUnitRange),
++            test_denormals: facts.live_has(DriverFact::DepthTestKeepsDenormals),
++            test_magnitudes: facts.live_has(DriverFact::DepthTestComparesMagnitudes),
+         }
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 8cb8e6b7..27ef226b 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -24,6 +24,8 @@
+ #![warn(missing_docs)]
+ 
+ mod address;
++/// macbox: live experiment switches (`M2V_LIVE`).
++pub mod live;
+ mod address_map;
+ mod address_pool;
+ mod amplification;
+diff --git a/crates/metal2vulkan-runtime/src/live.rs b/crates/metal2vulkan-runtime/src/live.rs
+new file mode 100644
+index 00000000..cc6e810b
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/live.rs
+@@ -0,0 +1,129 @@
++//! macbox experiment switches that change while the process runs. `M2V_LIVE=<path>`
++//! names a file of `name=value` lines (`#` starts a comment); a switch asked re-reads the file
++//! at most once a second, when its modification time changed, so an A/B pair shares one boot.
++//! Unset, every switch answers its default and no file is read. A changed file is logged once
++//! on stderr with the values taken. A switch decides only the work recorded or the objects made
++//! after the change: images, pipelines and passes made before keep the form they took.
++//!
++//! - [`on`]: a boolean switch (`1`/`true`/`on`/`yes`, `0`/`false`/`off`/`no`).
++//! - [`get`]: a switch's raw value.
++//! - [`fact`]: a driver fact as the device has it, unless `facts_off` or `facts_on` (comma lists
++//!   of `DriverFact` names) name it.
++
++use metal2vulkan::device::DriverFact;
++use std::collections::BTreeMap;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, OnceLock, RwLock};
++use std::time::{Instant, SystemTime};
++
++struct Live {
++    path: PathBuf,
++    /// Milliseconds since `START` at the last look at the file.
++    looked: AtomicU64,
++    mtime: RwLock<Option<SystemTime>>,
++    values: RwLock<Arc<BTreeMap<String, String>>>,
++}
++
++static START: OnceLock<Instant> = OnceLock::new();
++static LIVE: OnceLock<Option<Live>> = OnceLock::new();
++
++fn live() -> Option<&'static Live> {
++    LIVE.get_or_init(|| {
++        let path = PathBuf::from(std::env::var_os("M2V_LIVE")?);
++        START.get_or_init(Instant::now);
++        let live = Live {
++            path,
++            looked: AtomicU64::new(0),
++            mtime: RwLock::new(None),
++            values: RwLock::new(Arc::new(BTreeMap::new())),
++        };
++        live.refresh();
++        Some(live)
++    })
++    .as_ref()
++}
++
++impl Live {
++    fn refresh(&self) {
++        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
++        if *self.mtime.read().unwrap() == mtime && mtime.is_some() {
++            return;
++        }
++        *self.mtime.write().unwrap() = mtime;
++        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
++        let values: BTreeMap<String, String> = text
++            .lines()
++            .map(|l| l.split('#').next().unwrap_or("").trim())
++            .filter_map(|l| l.split_once('='))
++            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
++            .filter(|(k, _)| !k.is_empty())
++            .collect();
++        let line = format!("metal2vulkan live: {}: {values:?}\n", self.path.display());
++        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
++        *self.values.write().unwrap() = Arc::new(values);
++    }
++
++    fn values(&self) -> Arc<BTreeMap<String, String>> {
++        let now = START.get().map_or(0, |s| s.elapsed().as_millis() as u64);
++        let looked = self.looked.load(Ordering::Relaxed);
++        if now.saturating_sub(looked) >= 1000
++            && self
++                .looked
++                .compare_exchange(looked, now, Ordering::Relaxed, Ordering::Relaxed)
++                .is_ok()
++        {
++            self.refresh();
++        }
++        self.values.read().unwrap().clone()
++    }
++}
++
++/// The switch `name`'s value, where the file sets it.
++pub fn get(name: &str) -> Option<String> {
++    live()?.values().get(name).cloned()
++}
++
++/// The boolean switch `name`, `default` where the file does not set it (or sets it to neither).
++pub fn on(name: &str, default: bool) -> bool {
++    match get(name).as_deref() {
++        Some("1" | "true" | "on" | "yes") => true,
++        Some("0" | "false" | "off" | "no") => false,
++        _ => default,
++    }
++}
++
++/// Whether the comma list `list` names `item`.
++fn names(list: &str, item: &str) -> bool {
++    list.split(',').map(str::trim).any(|n| n == item)
++}
++
++/// The driver fact `fact` as `facts` (the device's) has it, unless the switch `facts_off` names
++/// it (off) or `facts_on` does (on).
++pub fn fact(facts: &std::collections::BTreeSet<DriverFact>, fact: DriverFact) -> bool {
++    let has = facts.contains(&fact);
++    let Some(live) = live() else { return has };
++    let values = live.values();
++    if !values.contains_key("facts_off") && !values.contains_key("facts_on") {
++        return has;
++    }
++    let name = format!("{fact:?}");
++    if values.get("facts_off").is_some_and(|l| names(l, &name)) {
++        return false;
++    }
++    if values.get("facts_on").is_some_and(|l| names(l, &name)) {
++        return true;
++    }
++    has
++}
++
++/// [`fact`] as a method of the device's fact set, for the runtime's read sites.
++pub(crate) trait LiveFacts {
++    fn live_has(&self, fact: DriverFact) -> bool;
++}
++
++impl LiveFacts for std::collections::BTreeSet<DriverFact> {
++    fn live_has(&self, f: DriverFact) -> bool {
++        fact(self, f)
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/mipmap_filter.rs b/crates/metal2vulkan-runtime/src/mipmap_filter.rs
+index 58767624..7f9458e6 100644
+--- a/crates/metal2vulkan-runtime/src/mipmap_filter.rs
++++ b/crates/metal2vulkan-runtime/src/mipmap_filter.rs
+@@ -28,6 +28,7 @@
+ //! scratch past `max_buffer_length`, a dispatch past `maxComputeWorkGroupCount`) or the scratch's
+ //! memory runs out, nothing is recorded and the call is refused.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::binding_view::{views_as, VkView};
+ use super::blit::BlitCommandEncoder;
+ use super::error::Error;
+@@ -306,6 +307,6 @@ fn fetch_view(plan: &ImagePlan, facts: &ImageFacts<'_>, device: &super::Device)
+         || device
+             .properties()
+             .driver_facts
+-            .contains(&DriverFact::SampledFetchRecoversCodes);
++            .live_has(DriverFact::SampledFetchRecoversCodes);
+     (sampled && exact).then_some(view)
+ }
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/render/residual.rs b/crates/metal2vulkan-runtime/src/pipeline/render/residual.rs
+index 851e8b7c..64a9932c 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/render/residual.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/render/residual.rs
+@@ -57,6 +57,7 @@
+ //! [`residual_made`]: RenderVariant::residual_made
+ //! [`residual_drawn`]: RenderVariant::residual_drawn
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::{DrawPipeline, GraphicsState, RenderVariant};
+ use crate::degradation::BoundFormats;
+ use crate::pipeline::graphics::GraphicsKey;
+@@ -177,5 +178,5 @@ pub(crate) fn reads_views_at_bind(device: &crate::Device) -> bool {
+ /// [`reads_views_at_bind`] of a device's driver facts alone, which a test can hand the facts of
+ /// each committed profile: the fact, and nothing of the driver's identity.
+ pub(crate) fn views_read_at_bind(facts: &BTreeSet<DriverFact>) -> bool {
+-    facts.contains(&DriverFact::ConstantOffsetUniformReadsPreloaded)
++    facts.live_has(DriverFact::ConstantOffsetUniformReadsPreloaded)
+ }
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 24a90d82..ba3449ed 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -262,6 +262,7 @@
+ //!   draws at once runs once per group of them: the encoder records the first group's pass, and
+ //!   as it ends each later group's, from its log, over a twin of the depth and stencil.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::address_map::{self, SamplerMaps};
+ use super::amplification::{Amplification, VertexAmplificationViewMapping};
+ use super::argument_table::{check_index, ArgumentTable};
+@@ -5624,7 +5625,7 @@ impl RenderLowering {
+             && device
+                 .properties()
+                 .driver_facts
+-                .contains(&DriverFact::RobustIndexFetchReadsZero)
++                .live_has(DriverFact::RobustIndexFetchReadsZero)
+     }
+ 
+     /// Bring `live`, the bind state the encoder's last draw bound, to the encoder's tables as a
+@@ -7857,7 +7858,7 @@ impl RenderLowering {
+         // the draw on: the encoder's layout once the draw is recorded.
+         let storage = self.storage_attachments(graphics)?;
+         let colors_ordered =
+-            (device.properties().driver_facts).contains(&DriverFact::InterlockOrdersDraws);
++            (device.properties().driver_facts).live_has(DriverFact::InterlockOrdersDraws);
+         let (interlocked, interlocked_writes) =
+             InterlockedStorage::of(graphics, &storage, colors_ordered);
+         let failing = match &failing_state {
+diff --git a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+index b39ec934..0f9afa2c 100644
+--- a/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
++++ b/crates/metal2vulkan-runtime/src/render/unused_bits_load.rs
+@@ -68,6 +68,7 @@
+ //!   reaches the rest through a heap or a sparse heap, which make one of it as the device does
+ //!   (`metal::format::padded_words`).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::capture::CapturedReach;
+ use crate::buffer_texture::Texels;
+ use crate::clear_reach::{DrawnTiles, PassReach};
+@@ -270,7 +271,7 @@ pub(super) fn metals_store(device: &Device) -> bool {
+     device
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::TileStoreIsMetals)
++        .live_has(DriverFact::TileStoreIsMetals)
+ }
+ 
+ /// Whether `color` is of a format the load pass rewrites ([`rewrites`]), loaded and not
+diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
+index 210b283b..4eaf142d 100644
+--- a/crates/metal2vulkan-runtime/src/render_pass.rs
++++ b/crates/metal2vulkan-runtime/src/render_pass.rs
+@@ -92,6 +92,7 @@
+ //! framebuffer limits is refused `Unsupported` (`Feature::RenderTargetSize`), naming the limit
+ //! (`framebuffer_fits`).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::attachment_stand_in::{self, Cause, StandIn};
+ use super::binding_view::views_as;
+ use super::buffer::Buffer;
+@@ -1786,7 +1787,7 @@ pub(super) fn layout(
+     let metals = device
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::ColorClearIsMetals);
++        .live_has(DriverFact::ColorClearIsMetals);
+     for color in colors.iter_mut().flatten() {
+         let Some(clear) = color.withheld_clear else {
+             continue;
+@@ -2051,7 +2052,7 @@ fn positioned_stand_in(
+     let planes = device
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::PositionedDepthReadAtStandardPositions);
++        .live_has(DriverFact::PositionedDepthReadAtStandardPositions);
+     let positioned = target.format.block().is_some_and(|b| b.depth.is_some())
+         && (!flagged || planes)
+         && !memoryless(&target.texture)
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index c37092eb..26da60fe 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -131,6 +131,7 @@
+ //!   until it completes. A render pass is never changed once made, so one serves every encoder
+ //!   and thread at once. The framebuffer is made per instance; its command buffer holds it.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::attachment_stand_in::Cause;
+ use super::attachmentless;
+ use super::binding_view::VkView;
+@@ -403,8 +404,8 @@ impl DontCare {
+     /// How `device` stores such an attachment.
+     pub(super) fn of(device: &Device) -> Self {
+         let facts = &device.properties().driver_facts;
+-        match facts.contains(&DriverFact::DontCareStoreIsOneOfMetals)
+-            || facts.contains(&DriverFact::DontCareStoreIsMetals)
++        match facts.live_has(DriverFact::DontCareStoreIsOneOfMetals)
++            || facts.live_has(DriverFact::DontCareStoreIsMetals)
+         {
+             true => Self::Discarded,
+             false => Self::Stored,
+@@ -926,7 +927,7 @@ pub(super) fn depth_layout(device: &Device, layout: &PassLayout) -> Result<vk::I
+         return Ok(general);
+     };
+     let measured = (device.properties().driver_facts)
+-        .contains(&DriverFact::MultisampledDepthFasterOutOfGeneral);
++        .live_has(DriverFact::MultisampledDepthFasterOutOfGeneral);
+     if !measured || ds.target.samples < 2 {
+         return Ok(general);
+     }
+diff --git a/crates/metal2vulkan-runtime/src/row_copies.rs b/crates/metal2vulkan-runtime/src/row_copies.rs
+index bd5918fb..e233cb0b 100644
+--- a/crates/metal2vulkan-runtime/src/row_copies.rs
++++ b/crates/metal2vulkan-runtime/src/row_copies.rs
+@@ -41,6 +41,7 @@
+ //! - **Counted.** `WorkCounts::row_copies`, `row_copy_regions`, `row_copy_regions_most` and
+ //!   `row_copies_dispatched`.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::owned_kernel::{OwnedBinds, OwnedKernel, OwnedModule, OwnedSet, OwnedSets};
+ use super::tracker::Access;
+ use super::Device;
+@@ -211,7 +212,7 @@ impl RowsDispatch {
+         let faster = device
+             .properties()
+             .driver_facts
+-            .contains(&DriverFact::RowCopiesDispatchFaster);
++            .live_has(DriverFact::RowCopiesDispatchFaster);
+         if !faster
+             || regions.len() < DISPATCH_ROWS
+             || src == vk::Buffer::null()
+diff --git a/crates/metal2vulkan-runtime/src/shadow_copy_back.rs b/crates/metal2vulkan-runtime/src/shadow_copy_back.rs
+index df3a2b2d..99b4df48 100644
+--- a/crates/metal2vulkan-runtime/src/shadow_copy_back.rs
++++ b/crates/metal2vulkan-runtime/src/shadow_copy_back.rs
+@@ -49,6 +49,7 @@
+ //! storage buffer range or workgroup counts, a buffer whose `VkBuffer` went, or a set the device
+ //! does not make: each copies back as before, the exact form every device takes.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::image_plan::{compatible, ImageFacts, ImagePlan};
+ use super::owned_kernel::{OwnedBinds, OwnedKernel, OwnedModule, OwnedSet};
+ use super::Device;
+@@ -77,7 +78,7 @@ pub(super) fn dispatches(device: &Device) -> bool {
+     device
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::ShadowCopyBackDispatchFaster)
++        .live_has(DriverFact::ShadowCopyBackDispatchFaster)
+ }
+ 
+ /// Whether `device` takes a merged texture's copy in and its keep as one dispatch, its shadows'
+@@ -86,7 +87,7 @@ pub(super) fn dispatches_in(device: &Device) -> bool {
+     device
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::ShadowCopyInDispatchFaster)
++        .live_has(DriverFact::ShadowCopyInDispatchFaster)
+ }
+ 
+ /// The unsigned-integer format of a texel `bytes` wide that a [`WordView`] takes, and the view as
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 85ab19f3..0eb14cb2 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -53,6 +53,7 @@
+ //!   in-process handle opens new textures over the same image.
+ //! - **Not yet:** blits of textures over buffers are refused `NotImplemented`.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::address::{ObjectsToken, RangeToken};
+ use super::address_map::AddressModeMap;
+ use super::attachment_stand_in::KeptBacking;
+@@ -1825,7 +1826,7 @@ impl Device {
+         // every queue's work: announced before the call that waits.
+         let first_sparse = !shared.sparse_image_made.swap(true, Ordering::Relaxed);
+         let facts = &self.properties().driver_facts;
+-        if first_sparse && facts.contains(&DriverFact::FirstSparseResourceWaitsForQueues) {
++        if first_sparse && facts.live_has(DriverFact::FirstSparseResourceWaitsForQueues) {
+             self.degrade(Degradation::FirstSparseResourceWait, || {
+                 let object = format!(
+                     "the device's first sparse texture, {pixel_format:?} {texture_type:?} of \
+@@ -3489,7 +3490,7 @@ impl Device {
+             && self
+                 .properties()
+                 .driver_facts
+-                .contains(&DriverFact::DepthStencilImagesStayGpuOptimized)
++                .live_has(DriverFact::DepthStencilImagesStayGpuOptimized)
+     }
+ 
+     /// Announce `optimized-depth-stencil-texture` for a depth or stencil texture of `descriptor`
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 6f15f1b3..1e13281c 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -195,6 +195,7 @@
+ //!   answers `heap`, `heap_offset`, `make_aliasable` and `is_aliasable` through the buffer, which
+ //!   is no resource of the program's (Metal's texture answers `buffer` nil).
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::first_move::FirstMove;
+ use super::heap_tiled::{
+     footprint_size, metal_compresses_layout, metal_heap_layout, modelled_size, own_heap_layout,
+@@ -2026,7 +2027,7 @@ impl Device {
+             };
+         }
+         let facts = &self.properties().driver_facts;
+-        if facts.contains(&DriverFact::DepthStencilImagesLieApart) && !colour(&optimal) {
++        if facts.live_has(DriverFact::DepthStencilImagesLieApart) && !colour(&optimal) {
+             let (_, length) = heap_planes(
+                 optimal.format,
+                 optimal.pixel_format,
+@@ -2048,7 +2049,7 @@ impl Device {
+             });
+         }
+         let hides =
+-            colour(&optimal) && facts.contains(&DriverFact::CompressedImagesHideAliasedWrites);
++            colour(&optimal) && facts.live_has(DriverFact::CompressedImagesHideAliasedWrites);
+         if !hides {
+             return Ok(HeapImage {
+                 plan: optimal,
+@@ -2058,7 +2059,11 @@ impl Device {
+             });
+         }
+         let policy = self.compile_device().policy().heap_compression;
+-        if compressed && policy == HeapCompressionPolicy::Compressed {
++        // macbox: the live switch `heap_compressed` overrides the policy for the heaps'
++        // textures made after it changes (`live.rs`).
++        let take_compressed =
++            crate::live::on("heap_compressed", policy == HeapCompressionPolicy::Compressed);
++        if compressed && take_compressed {
+             return Ok(HeapImage {
+                 plan: optimal,
+                 tiling: vk::ImageTiling::OPTIMAL,
+@@ -2095,7 +2100,7 @@ impl Device {
+         let facts = shared.textures.facts(self.compile_device().profile());
+         let transfer = FormatFeatureFlags2::HOST_IMAGE_TRANSFER;
+         let keeps = (self.properties().driver_facts)
+-            .contains(&DriverFact::HostTransferImagesKeepTheirBytes);
++            .live_has(DriverFact::HostTransferImagesKeepTheirBytes);
+         if !shared.host_image_copy || !keeps || !facts.optimal(optimal.format).contains(transfer) {
+             return Ok(None);
+         }
+@@ -2418,7 +2423,7 @@ impl Device {
+         // A driver that lays depth and stencil images apart from their memory makes no linear
+         // one over it (MoltenVK: Metal makes no depth texture over a buffer).
+         let driver = &self.properties().driver_facts;
+-        let apart = !colour(&linear) && driver.contains(&DriverFact::DepthStencilImagesLieApart);
++        let apart = !colour(&linear) && driver.live_has(DriverFact::DepthStencilImagesLieApart);
+         // Over pages imported as dma-buf memory (`dma_buf.rs`), an image of the driver's
+         // `DRM_FORMAT_MOD_LINEAR` layout, bound to a dedicated import of a dma-buf of its own
+         // pages as the texture is made (`heap_texture_at`), where it fits the answer; else the
+diff --git a/crates/metal2vulkan-runtime/src/texture/held_depth.rs b/crates/metal2vulkan-runtime/src/texture/held_depth.rs
+index 7918bb7c..dec60427 100644
+--- a/crates/metal2vulkan-runtime/src/texture/held_depth.rs
++++ b/crates/metal2vulkan-runtime/src/texture/held_depth.rs
+@@ -39,6 +39,7 @@
+ //!   usage says. A texture reached through an argument buffer without `use_resource` registers
+ //!   nothing, which Metal's contract does not allow.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use super::super::key_hash::KeyMap;
+ use super::super::resource::ResourceKey;
+ use super::super::tracker::{Access, Use, UseRange};
+@@ -59,7 +60,7 @@ pub(crate) const HELD: ImageLayout = ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIM
+ /// Whether a device's own texture of `plan` is held between passes on `device` (the module docs).
+ pub(crate) fn eligible(device: &Device, plan: &ImagePlan) -> bool {
+     let measured = (device.properties().driver_facts)
+-        .contains(&DriverFact::MultisampledDepthFasterOutOfGeneral);
++        .live_has(DriverFact::MultisampledDepthFasterOutOfGeneral);
+     let depth = plan
+         .format
+         .block()
+diff --git a/crates/metal2vulkan-runtime/src/word_fill.rs b/crates/metal2vulkan-runtime/src/word_fill.rs
+index afecfa6d..5fe2920c 100644
+--- a/crates/metal2vulkan-runtime/src/word_fill.rs
++++ b/crates/metal2vulkan-runtime/src/word_fill.rs
+@@ -18,6 +18,7 @@
+ //! - **Counted.** Each fill counts as one of the two forms (`WorkCounts::fills_recorded` and
+ //!   `fills_by_transfers`), so a run shows which its device took.
+ 
++use crate::live::LiveFacts as _; // macbox: live fact switches
+ use crate::Device;
+ use ash::vk;
+ use metal2vulkan::device::DriverFact;
+@@ -81,7 +82,7 @@ pub(crate) unsafe fn record(
+     let by_transfers = owner
+         .properties()
+         .driver_facts
+-        .contains(&DriverFact::FillCompiledPerCommandPool);
++        .live_has(DriverFact::FillCompiledPerCommandPool);
+     if words.is_empty() {
+         return;
+     }
