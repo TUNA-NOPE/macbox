@@ -14,7 +14,7 @@ panel. You can do almost all of it yourself, including the steps in macOS's GUI.
 - **An Apple Account is the user's.** macbox never signs in to one. Downloading Xcode's `.xip` needs
   a sign-in at developer.apple.com: ask the user to download it and tell you the path.
 - **Apple's license:** macOS's license allows it only on Apple hardware. Make sure the user knows
-  before you install it (README, "License and legal").
+  before you install it (README, "Disclaimer").
 - `./macbox build` takes 20 to 60 minutes and installing macOS another 30 to 60. Run them in the
   background and report progress, rather than waiting in silence.
 

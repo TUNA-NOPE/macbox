@@ -166,13 +166,26 @@ macbox is glue and tuning around other people's work, above all Reims vGPU, meta
 reims-util and their QEMU fork by Anees Iqbal ([steelbrain](https://github.com/steelbrain)).
 [CREDITS.md](CREDITS.md) lists every project macbox builds, runs or downloads, and its license.
 
-## License and legal
+## License
 
-macbox's own code is under the MIT license ([LICENSE](LICENSE)). The patches in `patches/` modify
-GPL/LGPL projects and are under those projects' licenses (see [patches/README.md](patches/README.md)).
+macbox's own code and documents are under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Use it, change it and share it for any noncommercial
+purpose: yourself, a hobby, research, teaching, a school, a charity, a public body. **Commercial use
+needs the author's permission**: open an issue to ask.
+
+The patches in `patches/` modify Reims vGPU and metal2vulkan, and stay under those projects' terms,
+`GPL-2.0-or-later OR LGPL-3.0-or-later` ([patches/README.md](patches/README.md)). Everything macbox
+builds or downloads keeps its own license ([CREDITS.md](CREDITS.md)).
+
+## Disclaimer
+
+**macbox comes as is, with no warranty of any kind, and its authors accept no liability for anything
+that comes of using it** (the license's "No Liability" section). It runs a virtual machine with
+direct access to your GPU, and can lose the VM's data, for example with `MACBOX_DISK_CACHE=unsafe`
+and a crash of the host.
 
 macbox ships no Apple software. macOS, Xcode and the simulator runtimes download from Apple, under
-Apple's terms. **Apple's software license agreement for macOS allows it to run only on
-Apple-branded hardware; running it in a VM on other hardware breaches that agreement.** You are
-responsible for how you use it. macbox is not affiliated with, sponsored or endorsed by Apple Inc.
+Apple's terms, and **you alone are responsible for complying with them. Apple's software license
+agreement for macOS allows it to run only on Apple-branded hardware; running it in a VM on other
+hardware breaches that agreement.** macbox is not affiliated with, sponsored or endorsed by Apple Inc.
 macOS, iOS, Xcode and Metal are trademarks of Apple Inc.

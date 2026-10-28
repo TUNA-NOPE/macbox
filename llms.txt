@@ -2,6 +2,8 @@
 
 > Run macOS, Xcode and the real iOS Simulator on a Linux host, in Docker, with GPU acceleration (Metal through Reims vGPU and metal2vulkan on the host's Vulkan GPU), for AI coding agents such as Claude Code, Codex and T3 Code. No Mac and no cloud service: one CLI, `macbox`, builds and runs it, and `mac-sim` gives each agent checkout its own iOS Simulator to build, run, tap, screenshot, record and measure at 60 fps.
 
+License: PolyForm Noncommercial 1.0.0 for macbox's own code (noncommercial use; commercial use needs permission); the patches stay GPL-2.0-or-later OR LGPL-3.0-or-later.
+
 Requirements: an x86-64 Linux host with KVM, AVX2, an Intel or AMD GPU with a Mesa Vulkan driver, 16 GB RAM or more, about 150 GB of SSD, and Docker. It runs macOS 26 Tahoe, Xcode 26 and iOS 26 simulators, which is the ceiling on x86-64. Apple's license allows macOS only on Apple hardware.
 
 ## Start here

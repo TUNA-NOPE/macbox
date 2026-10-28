@@ -50,4 +50,4 @@ the frames) follows the principles of [Appllama](https://appllama.io)'s app desi
 ## Apple
 
 macOS, Xcode and the iOS Simulator runtimes are Apple's, downloaded from Apple under Apple's
-terms; macbox contains none of them. See the legal note in the [README](README.md#license-and-legal).
+terms; macbox contains none of them. See the legal note in the [README](README.md#disclaimer).
