@@ -32,7 +32,9 @@ free_gb=$(df --output=avail -BG "$MACBOX_HOME" | tail -1 | tr -dc 0-9)
 # Rust, through rustup, into the container's HOME (kept across containers).
 if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
   say "installing rustup"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none >/dev/null
+  # (rustup notes that HOME isn't root's home: on purpose, the container's HOME is MACBOX_HOME/home)
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none >"$BUILD/rustup.log" 2>&1 ||
+    { cat "$BUILD/rustup.log" >&2; exit 1; }
 fi
 . "$HOME/.cargo/env"
 

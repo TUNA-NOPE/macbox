@@ -1,8 +1,16 @@
-# macbox
+# macbox: macOS, Xcode and the iOS Simulator on Linux, GPU-accelerated, for AI coding agents
 
-A full macOS VM with real GPU acceleration on a Linux PC, in Docker: the macOS desktop, Xcode, a
-pool of iOS Simulators, T3 Code's Device panel, and the tools AI coding agents need to build, run,
-drive and check iOS apps on their own. One command, `macbox`, sets it up and runs it.
+**Run the real iOS Simulator on a Linux machine, without a Mac and without a cloud service.**
+macbox runs a full macOS VM in Docker with real GPU acceleration (Metal, through Reims vGPU on
+your Vulkan GPU), with Xcode, a pool of iOS Simulators, T3 Code's Device panel, and the tools AI
+coding agents (Claude Code, Codex, T3 Code) need to build, run, drive and check iOS apps on their
+own. One command, `macbox`, sets it up and runs it.
+
+![The macOS desktop in macbox, with two iOS 26.5 Simulators: a Liquid Glass benchmark at 1x and Safari](docs/images/hero.jpg)
+
+<sub>macOS 26 Tahoe's desktop in macbox on an Intel iGPU, with two of its iOS 26.5 Simulators in front
+(their screens composited onto the desktop's screenshot): GlassBench, a Liquid Glass load, and
+Safari.</sub>
 
 ```
 Linux host (KVM + a Vulkan GPU + Docker)
@@ -78,6 +86,11 @@ Measured on an Intel Core Ultra 7 265 (its Arrow Lake iGPU), Mesa 26.2.4, macOS 
 iOS 26.5, 8 vCPUs and 12 GB. GlassBench is a table scrolling under Liquid Glass bars and a
 floating glass toolbar, counted at the simulator's own screen (frames per second; two runs).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/fps-dark.svg">
+  <img alt="iOS Simulator frame rate, Liquid Glass benchmark: 1x 53.5 to 94.2 fps, 2x 33.5 to 64.2, 3x 17.2 to 39.0, Reims as upstream shipped it vs the macbox build" src="docs/images/fps-light.svg" width="760">
+</picture>
+
 | | Reims 2ce3209, as upstream shipped it on 2026-10-26 | macbox build |
 |---|---|---|
 | iOS Simulator 1x (402x874), glass | 53.5 | **95.8 / 92.5** |
@@ -90,6 +103,49 @@ The GPU is the limit: a 3x simulator keeps this iGPU 96 to 98% busy. On a faster
 moves up. [docs/performance.md](docs/performance.md) has what the patches do, the method, what
 didn't help, and the known limits (an idle macOS display gets no vblank from its driver, so an
 animation starts about 0.1 s late: [reims-vgpu#141](https://github.com/steelbrain/reims-vgpu/issues/141)).
+
+## Questions people ask
+
+**Can I run the iOS Simulator on Linux?** Not by itself: it's part of Xcode, which needs macOS. macbox
+runs macOS in a VM on Linux with the GPU attached, so the real Simulator runs on your own machine,
+with no Mac, no cloud account and no per-minute bill.
+
+**How do I give Claude Code or Codex an iOS Simulator on a Linux server?** Set up macbox, then
+`macbox agents install`. Agents get `mac-sim` (a simulator per checkout: build, run, tap, screenshot,
+record), `sim-fps` (did that animation hold 60 fps?), and a skill that tells them when and how to use
+them. [docs/agents.md](docs/agents.md).
+
+**Docker-OSX or OSX-KVM, but with GPU acceleration?** Those boot macOS in QEMU too, but macOS gets
+Metal only when you pass a GPU it has drivers for through to the VM (VFIO), which takes that GPU
+away from the host. Otherwise the desktop and the Simulator draw in software. macbox uses Reims vGPU
+instead: Apple's own paravirtual GPU device, run on the host's Vulkan driver. The host keeps its GPU,
+macOS gets Metal, and an integrated GPU is enough.
+
+**Can I build and run an Expo or React Native iOS app on Linux?** Yes. `mac-sim run` copies the
+checkout into macOS, builds it with Xcode and CocoaPods, and installs it in the simulator. Metro runs
+on Linux, so JavaScript edits arrive by Fast Refresh. `MODE=release` gives a Release build, and
+`MODE=go` opens the app in Expo Go.
+
+**Does it work with T3 Code's Device panel?** Yes: the simulators stream live into the panel and take
+taps ([docs/t3-code.md](docs/t3-code.md)).
+
+**Real iPhones and TestFlight?** `phone-build` makes `.ipa` builds (EAS's free cloud builds first,
+then locally in the VM) and uploads to TestFlight. Signing for devices needs Apple's paid Developer
+Program ([skills/phone-builds](skills/phone-builds/SKILL.md)).
+
+**What can't it do?** Run macOS 27, Xcode 27 or iOS 27's simulators, which Apple ships for Apple
+silicon only. It also can't run macOS legally on non-Apple hardware (see below).
+
+## How it compares
+
+| | macbox | Docker-OSX, OSX-KVM | Cloud simulators | A Mac, or a remote Mac |
+|---|---|---|---|---|
+| Runs on | your Linux host | your Linux host | the provider's Macs | a Mac |
+| Metal in macOS | yes, on the host's GPU through Vulkan | only with a GPU passed through to the VM | yes | yes |
+| Cost | your hardware | your hardware | usually per minute or a plan | the Mac |
+| Built for agents (a simulator per checkout, screenshots, recordings, a 60 fps check, a skill) | yes | no | varies | with tools such as agent-device |
+| Newest iOS Simulator | 26.x (the x86-64 ceiling) | 26.x | the newest | the newest |
+| Apple's macOS license | not on non-Apple hardware | not on non-Apple hardware | yes | yes |
 
 ## Docs
 

@@ -15,6 +15,6 @@ What `macbox agents install` wires up for coding agents (Claude Code, Codex, and
   }
   ```
 
-- **Skills**: `skills/simulators` and `skills/phone-builds` are linked into `~/.claude/skills/` and `~/.agents/skills/`.
+- **Skills**: `skills/simulators`, `skills/phone-builds` and `skills/macbox` are linked into `~/.claude/skills/` and `~/.agents/skills/`.
 - **Commands**: `sims/bin/mac-sim` (it finds `mac-sim-remote` beside its real path and copies it to the Mac), `sim-fps`, `android-sim`, `android-gpu-desktop` and `skills/phone-builds/bin/phone-build` are linked into `~/.local/bin/`.
 - **User units**: `sims/systemd/mac-sim-idle.{service,timer}` (enable the timer) and, with the Android part, `android-gpu-desktop.service`.

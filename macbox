@@ -283,6 +283,7 @@ cmd_up() {
   local wd
   if in_c test -S /tmp/host-wayland/wayland-0; then
     wd=/tmp/host-wayland/wayland-0
+    in_c mkdir -p -m 700 /tmp/xdg   # the window's XDG_RUNTIME_DIR (vm.toml), which sway makes otherwise
   else
     wd=$(in_c "$REPO/container/display-up.sh" | sed -n 's/^WAYLAND_DISPLAY=//p')
   fi

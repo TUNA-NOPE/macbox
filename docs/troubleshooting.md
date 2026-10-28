@@ -11,7 +11,7 @@ with `REIMS_VGPU_STATS=1`, a line of frame statistics a second), `./macbox logs 
 | `a patch does not apply` | `versions.env` and `patches/` belong together; a local edit to one of them breaks the other. `git status` in the checkout |
 | `only N GB free` | the build needs about 25 GB in `MACBOX_HOME`. `FORCE=1 ./macbox build` tries anyway |
 | QEMU's configure stops on a missing package | the image changed under it: `./macbox build` again rebuilds the image first |
-| `rustup` prints "$HOME differs from euid-obtained home directory" | harmless: the container's HOME is `MACBOX_HOME/home` on purpose |
+| the build stops at rustup | `MACBOX_HOME/build/rustup.log`; rustup needs https://sh.rustup.rs and static.rust-lang.org |
 
 ## Starting
 

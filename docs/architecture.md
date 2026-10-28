@@ -133,9 +133,10 @@ lib/vmctl.py              screenshots, mouse and keyboard through QMP
 patches/                  the series on Reims vGPU and metal2vulkan
 guest/                    everything copied into macOS (macbox-guest and its tools)
 sims/                     the agent tools on the host (mac-sim, sim-fps, android-sim) and their user units
-skills/                   the simulators and phone-builds skills
+skills/                   the simulators, phone-builds and macbox (setup) skills
 agents/                   the instructions snippet and the Claude Code hook
 bench/                    the benchmark tools (simfps, GlassBench, GenieBench)
-docs/                     these documents
+docs/                     these documents; docs/images: the README's pictures and make-chart.py
+llms.txt, AGENTS.md        entry points for language models and for an agent setting macbox up
 ```
 

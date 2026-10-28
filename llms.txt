@@ -1,0 +1,26 @@
+# macbox
+
+> Run macOS, Xcode and the real iOS Simulator on a Linux host, in Docker, with GPU acceleration (Metal through Reims vGPU and metal2vulkan on the host's Vulkan GPU), for AI coding agents such as Claude Code, Codex and T3 Code. No Mac and no cloud service: one CLI, `macbox`, builds and runs it, and `mac-sim` gives each agent checkout its own iOS Simulator to build, run, tap, screenshot, record and measure at 60 fps.
+
+Requirements: an x86-64 Linux host with KVM, AVX2, an Intel or AMD GPU with a Mesa Vulkan driver, 16 GB RAM or more, about 150 GB of SSD, and Docker. It runs macOS 26 Tahoe, Xcode 26 and iOS 26 simulators, which is the ceiling on x86-64. Apple's license allows macOS only on Apple hardware.
+
+## Start here
+
+- [README](https://github.com/TUNA-NOPE/macbox/blob/main/README.md): what it is, requirements, quick start, performance, FAQ, comparison with Docker-OSX and cloud simulators
+- [AGENTS.md](https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md): for an agent setting macbox up on a host, including the steps in macOS's GUI (macbox screenshot, click, type)
+- [Setup, step by step](https://github.com/TUNA-NOPE/macbox/blob/main/docs/setup.md)
+
+## Using it from an agent
+
+- [The simulators skill](https://github.com/TUNA-NOPE/macbox/blob/main/skills/simulators/SKILL.md): mac-sim and android-sim commands, T3 Code's Device panel, the verify-every-UI-change loop with sim-fps
+- [Agents guide](https://github.com/TUNA-NOPE/macbox/blob/main/docs/agents.md): installing the tools, the skill and the instructions
+- [T3 Code's Device panel](https://github.com/TUNA-NOPE/macbox/blob/main/docs/t3-code.md)
+- [Phone builds](https://github.com/TUNA-NOPE/macbox/blob/main/skills/phone-builds/SKILL.md): .ipa / TestFlight / .apk with EAS, cloud first then local
+
+## How it works
+
+- [Architecture](https://github.com/TUNA-NOPE/macbox/blob/main/docs/architecture.md): the container, QEMU and Reims vGPU, the display stream, the network, the guest, the simulator pool
+- [Performance](https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md): the metal2vulkan patches, measurements, tuning, known limits
+- [Patches](https://github.com/TUNA-NOPE/macbox/blob/main/patches/README.md)
+- [Troubleshooting](https://github.com/TUNA-NOPE/macbox/blob/main/docs/troubleshooting.md)
+- [Credits](https://github.com/TUNA-NOPE/macbox/blob/main/CREDITS.md)

@@ -13,7 +13,7 @@ measure.
 | What | Where |
 |---|---|
 | `mac-sim`, `mac-sim-remote`, `sim-fps`, `android-sim`, `android-gpu-desktop`, `phone-build`, `macbox` | links in `~/.local/bin` |
-| the `simulators` and `phone-builds` skills | links in `~/.claude/skills` and `~/.agents/skills` |
+| the `simulators`, `phone-builds` and `macbox` skills | links in `~/.claude/skills` and `~/.agents/skills` |
 | the "Simulators" section of the instructions ([agents/simulators-snippet.md](../agents/simulators-snippet.md)) | between `<!-- macbox:simulators -->` markers in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` (each backed up as `.bak-macbox`) |
 | `mac-sim-idle.timer` | a user unit, enabled: idle pool simulators shut down after 20 minutes |
 

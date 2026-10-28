@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="370" viewBox="0 0 900 370" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect width="900" height="370" rx="12" fill="#fcfcfb"/>
+<text x="24" y="38" font-size="19" font-weight="600" fill="#0b0b0b">iOS Simulator frame rate, Liquid Glass benchmark</text>
+<text x="24" y="62" font-size="13.5" fill="#52514e">Frames per second on an Intel Arrow Lake iGPU (Core Ultra 7 265). Higher is better.</text>
+<rect x="24" y="80" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="42" y="91" font-size="13" fill="#52514e">Reims vGPU as upstream shipped it (2ce3209)</text>
+<rect x="369.0" y="80" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="387.0" y="91" font-size="13" fill="#52514e">macbox build</text>
+<line x1="190.0" y1="106" x2="190.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="190.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">0</text>
+<line x1="320.0" y1="106" x2="320.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="320.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">20</text>
+<line x1="450.0" y1="106" x2="450.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="450.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">40</text>
+<line x1="580.0" y1="106" x2="580.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="580.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">60</text>
+<line x1="710.0" y1="106" x2="710.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="710.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">80</text>
+<line x1="840.0" y1="106" x2="840.0" y2="316" stroke="#e4e3df" stroke-width="1"/>
+<text x="840.0" y="334" font-size="12" text-anchor="middle" fill="#52514e">100</text>
+<text x="840" y="352" font-size="12" text-anchor="end" fill="#52514e">frames per second</text>
+<line x1="580.0" y1="98" x2="580.0" y2="316" stroke="#52514e" stroke-width="1.5" stroke-dasharray="4 4"/>
+<text x="586.0" y="106" font-size="12" fill="#52514e">60 fps</text>
+<text x="176" y="140.0" font-size="13.5" text-anchor="end" fill="#0b0b0b">1x · 402×874</text>
+<path d="M190,112 H533.75 Q537.75,112 537.75,116 V130 Q537.75,134 533.75,134 H190 Z" fill="#eb6834"/>
+<text x="545.8" y="127.5" font-size="13" fill="#0b0b0b">53.5</text>
+<path d="M190,136 H797.975 Q801.975,136 801.975,140 V154 Q801.975,158 797.975,158 H190 Z" fill="#2a78d6"/>
+<text x="810.0" y="151.5" font-size="13" fill="#0b0b0b">94.2</text>
+<text x="176" y="216.0" font-size="13.5" text-anchor="end" fill="#0b0b0b">2x · 804×1748</text>
+<path d="M190,188 H403.75 Q407.75,188 407.75,192 V206 Q407.75,210 403.75,210 H190 Z" fill="#eb6834"/>
+<text x="415.8" y="203.5" font-size="13" fill="#0b0b0b">33.5</text>
+<path d="M190,212 H602.9750000000001 Q606.9750000000001,212 606.9750000000001,216 V230 Q606.9750000000001,234 602.9750000000001,234 H190 Z" fill="#2a78d6"/>
+<text x="615.0" y="227.5" font-size="13" fill="#0b0b0b">64.2</text>
+<text x="176" y="292.0" font-size="13.5" text-anchor="end" fill="#0b0b0b">3x · 1206×2622</text>
+<path d="M190,264 H297.8 Q301.8,264 301.8,268 V282 Q301.8,286 297.8,286 H190 Z" fill="#eb6834"/>
+<text x="309.8" y="279.5" font-size="13" fill="#0b0b0b">17.2</text>
+<path d="M190,288 H439.5 Q443.5,288 443.5,292 V306 Q443.5,310 439.5,310 H190 Z" fill="#2a78d6"/>
+<text x="451.5" y="303.5" font-size="13" fill="#0b0b0b">39.0</text>
+</svg>
