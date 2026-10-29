@@ -102,7 +102,7 @@ def guide_list(guides, exclude=None):
 
 def render(page, guides, layout, css):
     body = page["body"].replace("{{guides}}", guide_list(guides))
-    body = re.sub(r"&(?![a-zA-Z]+;|#\d+;)", "&amp;", body)  # `&&` in commands, written plainly in the pages
+    body = re.sub(r"&(?![a-zA-Z]+;|#\d+;|#[xX][0-9a-fA-F]+;)", "&amp;", body)  # `&&` in commands, written plainly in the pages
     body = re.sub(r"<thead>.*?</thead>", lambda m: m.group(0).replace("<th>", '<th scope="col">').replace('<th class="', '<th scope="col" class="'), body, flags=re.S)
     body = re.sub(r"<tbody>.*?</tbody>", lambda m: m.group(0).replace("<th>", '<th scope="row">'), body, flags=re.S)
     is_guide = page.get("kind") == "guide"
