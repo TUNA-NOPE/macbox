@@ -110,6 +110,25 @@ import json, sys; v = json.load(sys.stdin)['sdkVersions'].get('$sdk.0.0') or {};
     xcrun simctl install "$u" "$d/Expo Go.app" || die "could not install Expo Go"
     echo "installed $(basename "$d")" ;;
   build)
+    # Bun, pinned, for projects with a bun lockfile: the release zip from GitHub, checked against the SHA-256 in
+    # the release's SHASUMS256.txt. That file's signature by Bun's release key (Robobun,
+    # F3DCC08A8572C0749B3E18888EAB4D40A7B22B59) was verified on 2026-10-29. To move to a new version,
+    # verify the new SHASUMS256.txt.asc the same way and replace the version and both sums.
+    BUN_VERSION=1.4.2
+    install_bun() {
+      local z h t
+      case "$(uname -m)" in
+        x86_64) z=bun-darwin-x64 h=80520d7e17526308c9185d261679ac6d27798d3803a0e9f7ff9121ab8affb012 ;;
+        arm64) z=bun-darwin-aarch64 h=90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f ;;
+        *) return 1 ;;
+      esac
+      t=$(mktemp -d) || return 1
+      curl -fsSL -o "$t/$z.zip" "https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$z.zip" &&
+        echo "$h  $t/$z.zip" | shasum -a 256 -c - >/dev/null &&
+        unzip -q "$t/$z.zip" -d "$t" && mkdir -p "$HOME/.bun/bin" && mv "$t/$z/bun" "$HOME/.bun/bin/bun" &&
+        chmod 755 "$HOME/.bun/bin/bun"
+      local rc=$?; rm -rf "$t"; return $rc
+    }
     src="$1" sub="$2" u="$3" port="$4" conf="${5:-Debug}" kind="${6:-managed}" rn="${7:-prebuilt}"
     src=$(cd "$src" 2>/dev/null && pwd) || die "no folder $1 on the Mac"
     app=$(cd "$src/$sub" 2>/dev/null && pwd) || die "no app folder $sub in $src"
@@ -125,7 +144,7 @@ import json, sys; v = json.load(sys.stdin)['sdkVersions'].get('$sdk.0.0') or {};
       echo "== installing dependencies ($(basename "${lock:-package.json}"))"
       ( cd "$lockdir" && case "$(basename "${lock:-none}")" in
           bun.lock|bun.lockb)
-            [ -x "$HOME/.bun/bin/bun" ] || curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+            [ -x "$HOME/.bun/bin/bun" ] || install_bun || die "could not install bun $BUN_VERSION"
             "$HOME/.bun/bin/bun" install --frozen-lockfile || "$HOME/.bun/bin/bun" install ;;
           pnpm-lock.yaml) corepack pnpm install --frozen-lockfile ;;
           yarn.lock) corepack yarn install --frozen-lockfile || corepack yarn install ;;
