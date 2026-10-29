@@ -79,10 +79,12 @@ def json_ld(page, guides):
         graph.append({
             "@type": "TechArticle", "headline": page["title"], "description": page["description"],
             "url": absolute(page["url"]), "mainEntityOfPage": absolute(page["url"]),
-            "datePublished": page["published"], "dateModified": page["updated"],
+            "datePublished": page["published"] + "T00:00:00Z", "dateModified": page["updated"] + "T00:00:00Z",
             "inLanguage": "en", "image": absolute("/images/social-preview.jpg"),
             "author": {"@type": "Organization", "name": "macbox", "url": REPO_URL},
-            "about": {"@id": absolute("/#software")}, "isPartOf": {"@id": absolute("/#website")}})
+            "about": {"@type": "SoftwareSourceCode", "@id": absolute("/#software"), "name": NAME,
+                      "codeRepository": REPO_URL, "url": absolute("/")},
+            "isPartOf": {"@type": "WebSite", "@id": absolute("/#website"), "name": NAME, "url": absolute("/")}})
     crumbs.append((page["url"], page.get("short", page["title"])))
     graph.append({"@type": "BreadcrumbList", "itemListElement": [
         {"@type": "ListItem", "position": i + 1, "name": n, "item": absolute(u)} for i, (u, n) in enumerate(crumbs)]})
