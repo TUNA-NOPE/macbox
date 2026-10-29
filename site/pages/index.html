@@ -1,53 +1,106 @@
 title: macbox: give your AI agents a Mac and iOS Simulators on Linux
 description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine with your own GPU, so Claude Code, Codex and T3 Code can build, tap and test your iPhone app.
 ---
-<div class="hero">
-  <div class="wrap hero-text">
-    <p class="supported"><span>Officially supports</span> <b>Claude Code</b> <b>Codex</b> <b>T3 Code</b></p>
-    <h1>Give your agents a&nbsp;Mac</h1>
-    <p class="lead">macbox puts macOS, Xcode and iPhone simulators on the Linux machine you already have. Your AI coding agent can build your app, open it, tap through it and check that it runs smoothly. No Mac to buy, no cloud bill.</p>
-    <div class="ctas">
-      <a class="btn primary" href="#get-started">Get started</a>
-      <a class="btn" href="https://github.com/TUNA-NOPE/macbox">View on GitHub <span aria-hidden="true">↗</span></a>
-    </div>
+<section class="wrap hero">
+  <p class="supported"><span>Official support for</span> <b>Claude Code</b> <b>Codex</b> <b>T3 Code</b></p>
+  <h1>Give your agents a&nbsp;Mac</h1>
+  <p class="lead">macbox runs macOS, Xcode and iPhone simulators on your Linux machine, so your coding agent can build the app, tap through it and check it's smooth before it says done.</p>
+  <div class="ctas">
+    <a class="btn primary" href="#get-started">Get started</a>
+    <a class="btn" href="https://github.com/TUNA-NOPE/macbox">View on GitHub</a>
   </div>
-  <figure class="wrap shot">
-    <div class="window">
-      <div class="titlebar" aria-hidden="true"><span class="dots"><i></i><i></i><i></i></span><span>macOS 26 in macbox, on Linux</span></div>
-      <picture>
-        <source type="image/webp" srcset="/images/hero-800.webp 800w, /images/hero-1600.webp 1600w" sizes="(max-width: 1120px) calc(100vw - 48px), 1072px">
-        <img src="/images/hero-1600.jpg" width="1600" height="923" fetchpriority="high" alt="The macOS 26 Tahoe desktop running in macbox on Linux, with two iOS 26.5 Simulators in front: a Liquid Glass benchmark and Safari showing a GitHub page">
-      </picture>
+  <figure class="stage">
+    <div class="panel dusk">
+      <div class="ui term">
+        <div class="tb" aria-hidden="true"><i></i><i></i><i></i><b>Claude Code</b><span>~/glassbench</span></div>
+        <div class="body">
+          <p class="msg">Run GlassBench on the iPhone simulator and check the scroll stays smooth.</p>
+          <div class="step"><span class="ok">✓</span><code>mac-sim up</code><span class="dim">macbox slim 1</span></div>
+          <div class="step"><span class="ok">✓</span><code>mac-sim run</code><span class="dim">built with Xcode, installed</span></div>
+          <div class="step"><span class="ok">✓</span><code>mac-sim shot /tmp/home.png</code></div>
+          <div class="step"><span class="ok">✓</span><code>mac-sim record /tmp/scroll.mp4 5</code></div>
+          <div class="step"><span class="ok">✓</span><code>sim-fps /tmp/scroll.mp4</code><span class="dim">60 fps held in every stretch</span></div>
+          <p class="reply">Done. The scroll held 60 fps with no dropped frames. <span class="pill">screenshot attached</span></p>
+        </div>
+      </div>
+      <div class="phone p1"><img src="/images/sim-glass.webp" width="328" height="731" fetchpriority="high" alt="GlassBench, a Liquid Glass benchmark, in an iOS 26.5 Simulator"></div>
+      <div class="phone p2"><img src="/images/sim-safari.webp" width="328" height="731" alt="Safari showing a GitHub page in an iOS 26.5 Simulator"></div>
+      <div class="chip" aria-hidden="true"><span class="dot">✓</span>60 fps held · 0 dropped</div>
     </div>
-    <figcaption>Two iOS 26.5 Simulators on macOS 26 Tahoe, in macbox on an Intel integrated GPU. Their screens are composited onto a screenshot of the desktop.</figcaption>
+    <figcaption>An agent's session, drawn as an illustration. The simulator screens are real: iOS 26.5 in macbox on an Intel integrated GPU.</figcaption>
   </figure>
-</div>
+</section>
 
-<section class="band" id="what-agents-do">
-  <div class="wrap">
-    <header>
-      <p class="kicker">What your agent gets</p>
-      <h2>The power of a simulator, on Linux</h2>
-      <p>Coding agents are good at writing iPhone apps and blind when it comes to running them. macbox gives each one a real simulator to work with.</p>
-    </header>
-    <div class="grid four">
-      <div><span class="ico" aria-hidden="true">⌘</span><h3>Build</h3><p>Real Xcode on real macOS builds the app, CocoaPods and all. Expo and React Native work too.</p></div>
-      <div><span class="ico" aria-hidden="true">▶</span><h3>Run</h3><p>Every project gets its own iOS Simulator, so several agents can work side by side.</p></div>
-      <div><span class="ico" aria-hidden="true">◎</span><h3>Look and tap</h3><p>The agent taps, types, takes screenshots and records video, the way you'd try the app yourself.</p></div>
-      <div><span class="ico" aria-hidden="true">≈</span><h3>Check it's smooth</h3><p>It records an animation and measures it, so "done" means the screen really holds 60 fps.</p></div>
+<section class="wrap band" id="what-agents-do">
+  <div class="head">
+    <h2>Everything an agent needs to test an iPhone app</h2>
+    <p>Coding agents write iPhone apps well and can't run them. macbox gives each one a real simulator, and the tools to use it the way a developer would.</p>
+  </div>
+  <div class="feats">
+    <div class="feat">
+      <div class="panel sky">
+        <div class="phone"><img src="/images/sim-glass.webp" width="328" height="731" loading="lazy" alt=""></div>
+        <div class="cursor" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 3l14 8-6 1.5L10 19z" fill="#111" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg><span>Tapping Card 62</span></div>
+      </div>
+      <h3>Tests on a real iOS Simulator</h3>
+      <p>Real Xcode builds the app and installs it in a simulator. The agent taps, types, takes screenshots and records video. Expo and React Native work too.</p>
+    </div>
+    <div class="feat">
+      <div class="panel dusk">
+        <div class="ui t3" aria-hidden="true">
+          <div class="tb"><i></i><i></i><i></i><b>T3 Code</b><span>Device · macbox slim 1 · live</span></div>
+          <div class="dev"><div class="phone"><img src="/images/sim-safari.webp" width="328" height="731" loading="lazy" alt=""></div></div>
+        </div>
+      </div>
+      <h3>Live in T3 Code's Device panel</h3>
+      <p>The simulator streams into T3 Code as the agent works. Watch what it does, and tap in yourself whenever you like.</p>
+    </div>
+    <div class="feat sm">
+      <div class="panel sand">
+        <div class="ui mini" aria-hidden="true"><div class="body">
+          <span class="dim">sim-fps /tmp/scroll.mp4</span>
+          <p class="big">60 fps</p>
+          <span class="pill">held in every stretch</span>
+          <div class="bars"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div></div>
+      </div>
+      <h3>Checks it's smooth</h3>
+      <p>The agent records an animation and measures it, so "done" means no dropped frames.</p>
+    </div>
+    <div class="feat sm">
+      <div class="panel sky">
+        <div class="ui mini rows" aria-hidden="true"><div class="body">
+          <div class="r"><span>macbox slim 1</span><span class="busy">feature/checkout</span></div>
+          <div class="r"><span>macbox slim 2</span><span class="busy">fix/login</span></div>
+          <div class="r"><span>macbox sharp</span><span>free · 3x stills</span></div>
+          <div class="r"><span>macbox full</span><span>widgets, Dynamic Island</span></div>
+        </div></div>
+      </div>
+      <h3>A simulator per checkout</h3>
+      <p>Several agents work side by side, each on its own simulator, with a full one for widgets and Live Activities.</p>
+    </div>
+    <div class="feat sm">
+      <div class="panel dusk">
+        <div class="ui mini rows" aria-hidden="true"><div class="body">
+          <div class="r"><span>Host GPU</span><span>Intel or AMD</span></div>
+          <div class="r"><span>Driver</span><span>Mesa Vulkan</span></div>
+          <div class="r"><span>macOS draws with</span><span class="busy">Metal</span></div>
+          <div class="r"><span>GPU passthrough</span><span>not needed</span></div>
+        </div></div>
+      </div>
+      <h3>Fast, on your own GPU</h3>
+      <p>macOS gets Metal on your graphics card without taking it from Linux. An integrated GPU is enough.</p>
     </div>
   </div>
 </section>
 
-<section class="band" id="agents">
-  <div class="wrap split">
+<section class="wrap band" id="agents">
+  <div class="split">
     <div>
-      <p class="kicker">Official support</p>
       <h2>Works with the agents you already use</h2>
-      <p><strong>Claude Code</strong> and <strong>Codex</strong> get a skill that tells them when to open a simulator and how to test with it. <strong>T3 Code</strong> shows the simulator live in its Device panel: you watch the agent work and can tap in yourself.</p>
-      <p>One command sets it all up, and the integrations ship and are maintained with macbox.</p>
+      <p class="muted">Claude Code and Codex get a skill that tells them when to open a simulator and how to test with it. T3 Code shows the simulator in its Device panel. The integrations ship with macbox and are maintained with it.</p>
       <p><a href="/guides/ios-simulator-for-ai-coding-agents/">How agents use it →</a></p>
-      <p class="note">"Officially supported" is macbox's own commitment. macbox isn't affiliated with or endorsed by Anthropic, OpenAI or T3.</p>
+      <p class="note">"Official support" is macbox's own commitment. macbox isn't affiliated with or endorsed by Anthropic, OpenAI or T3.</p>
     </div>
     <div>
 <pre><code>./macbox agents install   <span class="c"># Claude Code and Codex</span>
@@ -62,22 +115,31 @@ description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine w
   </div>
 </section>
 
-<section class="band" id="how-it-works">
-  <div class="wrap">
-    <header>
-      <p class="kicker">How it works</p>
-      <h2>A Mac in a box, on your own GPU</h2>
-      <p>macbox runs macOS in a virtual machine inside Docker. Unlike other ways of doing that, macOS draws with your machine's graphics card, so the simulator is fast and Linux keeps using the GPU too.</p>
-    </header>
-    <ol class="flow">
-      <li><b>Your Linux machine</b><span>A PC or server with an Intel or AMD GPU</span></li>
-      <li><b>macbox</b><span>One container with a macOS VM and its GPU</span></li>
-      <li><b>macOS and Xcode</b><span>macOS 26 Tahoe, Xcode 26, iOS 26 simulators</span></li>
-      <li><b>Your agent</b><span>Builds, runs, taps and checks your app</span></li>
-    </ol>
-    <details class="more">
-      <summary>Under the hood</summary>
-      <p>QEMU gives macOS Apple's own paravirtual GPU through <a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a>, and <a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a> runs macOS's Metal work on the host's Vulkan driver (Mesa). No GPU is passed through, so an integrated GPU is enough. After a short install in the VM's screen, everything else runs over SSH: <code>macbox xcode</code> installs the Xcode you download from Apple, <code>macbox pool</code> creates the simulators, and <code>mac-sim</code> copies a checkout into macOS, builds it there and runs Metro on Linux.</p>
+<section class="wrap band" id="how-it-works">
+  <div class="head">
+    <h2>A real Mac, in a box on Linux</h2>
+    <p>macbox runs macOS in a virtual machine inside one Docker container. Unlike other ways of doing that, macOS draws with your machine's graphics card.</p>
+  </div>
+  <div class="steps3">
+    <div><span class="idx">01</span><h3>Install it on Linux</h3><p>A PC or server with an Intel or AMD GPU. Your agent can do the whole setup.</p></div>
+    <div><span class="idx">02</span><h3>Connect your agent</h3><p>One command adds the tools and skills for Claude Code, Codex and T3 Code.</p></div>
+    <div><span class="idx">03</span><h3>Let it test</h3><p>Before it calls a UI change done, it builds, runs, taps, looks and measures.</p></div>
+  </div>
+  <figure class="desk">
+    <div class="panel sky">
+      <div class="win">
+        <div class="tb" aria-hidden="true"><i></i><i></i><i></i><span>macOS 26 in macbox, on Linux</span></div>
+        <picture>
+          <source type="image/webp" srcset="/images/hero-800.webp 800w, /images/hero-1600.webp 1600w" sizes="(max-width: 1160px) calc(100vw - 80px), 1060px">
+          <img src="/images/hero-1600.jpg" width="1600" height="923" loading="lazy" alt="The macOS 26 Tahoe desktop running in macbox on Linux, with two iOS 26.5 Simulators in front: a Liquid Glass benchmark and Safari showing a GitHub page">
+        </picture>
+      </div>
+    </div>
+    <figcaption>macOS 26 Tahoe in macbox on an Intel integrated GPU. The simulators' screens are composited onto a screenshot of the desktop.</figcaption>
+  </figure>
+  <details class="more">
+    <summary>Under the hood</summary>
+    <p>QEMU gives macOS Apple's own paravirtual GPU through <a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a>, and <a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a> runs macOS's Metal work on the host's Vulkan driver (Mesa). No GPU is passed through, so an integrated GPU is enough. After a short install in the VM's screen, everything else runs over SSH: <code>macbox xcode</code> installs the Xcode you download from Apple, <code>macbox pool</code> creates the simulators, and <code>mac-sim</code> copies a checkout into macOS, builds it there and runs Metro on Linux.</p>
 <pre class="diagram"><code>Linux host (KVM + a Vulkan GPU + Docker)
 └─ container macbox
    └─ QEMU with Reims vGPU ──► metal2vulkan ──► Vulkan (Mesa) on your GPU
@@ -85,64 +147,57 @@ description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine w
          ├─ Xcode, CocoaPods, Node
          ├─ iOS Simulators: a pool, one per agent checkout (mac-sim)
          └─ T3 Code's device hub  ──► the Device panel, live</code></pre>
-      <p><a href="/guides/gpu-accelerated-macos-vm-on-linux/">How the GPU path works →</a></p>
-    </details>
-  </div>
+    <p><a href="/guides/gpu-accelerated-macos-vm-on-linux/">How the GPU path works →</a></p>
+  </details>
 </section>
 
-<section class="band" id="performance">
-  <div class="wrap">
-    <header>
-      <p class="kicker">Measured, not estimated</p>
+<section class="wrap band" id="performance">
+  <div class="perf">
+    <div>
+      <p class="big">92–96<small> fps</small></p>
       <h2>Smooth enough to judge an animation</h2>
-      <p>On an Intel integrated GPU, an iPhone simulator runs a heavy Liquid Glass screen at 92 to 96 frames a second, almost twice the speed of the GPU code macbox builds on.</p>
-    </header>
+      <p class="muted">An iPhone simulator running a heavy Liquid Glass screen on an Intel integrated GPU. That's almost twice the speed of the GPU code macbox builds on.</p>
+    </div>
     <figure class="chart">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="/images/fps-dark.svg">
         <img src="/images/fps-light.svg" width="900" height="370" loading="lazy" alt="iOS Simulator frame rate in a Liquid Glass benchmark. 1x: 53.5 fps upstream, 94.2 with the macbox build. 2x: 33.5 and 64.2. 3x: 17.2 and 39.0.">
       </picture>
     </figure>
-    <details class="more">
-      <summary>The exact numbers</summary>
-      <div class="table"><table>
-        <thead><tr><th>Workload</th><th class="num">Reims 2ce3209, upstream</th><th class="num">macbox build (two runs)</th></tr></thead>
-        <tbody>
-          <tr><th>iOS Simulator 1x (402×874), Liquid Glass</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
-          <tr><th>iOS Simulator 2x (804×1748), Liquid Glass</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
-          <tr><th>iOS Simulator 3x (1206×2622, an iPhone's pixels)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
-          <tr><th>Safari at 3x, a page under a blurred floating bar</th><td class="num">n/a</td><td class="num">66.4 / 64.2 fps</td></tr>
-          <tr><th>macOS desktop, Genie minimize at 3440×1440</th><td class="num">~12 frames</td><td class="num">19.5 frames</td></tr>
-        </tbody>
-      </table></div>
-      <p class="note">Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, a VM with 8 vCPUs and 12 GB. Frames counted at the simulator's own screen, after a warm-up, one simulator animating. The GPU is the limit, so a faster GPU moves every number up; other GPUs haven't been measured yet. Method and patches: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
-    </details>
   </div>
+  <details class="more">
+    <summary>The exact numbers</summary>
+    <div class="table"><table>
+      <thead><tr><th>Workload</th><th class="num">Reims 2ce3209, upstream</th><th class="num">macbox build (two runs)</th></tr></thead>
+      <tbody>
+        <tr><th>iOS Simulator 1x (402×874), Liquid Glass</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
+        <tr><th>iOS Simulator 2x (804×1748), Liquid Glass</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
+        <tr><th>iOS Simulator 3x (1206×2622, an iPhone's pixels)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
+        <tr><th>Safari at 3x, a page under a blurred floating bar</th><td class="num">n/a</td><td class="num">66.4 / 64.2 fps</td></tr>
+        <tr><th>macOS desktop, Genie minimize at 3440×1440</th><td class="num">~12 frames</td><td class="num">19.5 frames</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, a VM with 8 vCPUs and 12 GB. Frames counted at the simulator's own screen, after a warm-up, one simulator animating. The GPU is the limit, so a faster GPU moves every number up; other GPUs haven't been measured yet. Method and patches: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
+  </details>
 </section>
 
-<section class="band" id="compare">
-  <div class="wrap">
-    <header>
-      <p class="kicker">Why macbox</p>
-      <h2>Instead of a Mac, a cloud or a slow VM</h2>
-    </header>
-    <div class="grid">
-      <div><h3>Instead of buying a Mac</h3><p>Use the Linux machine your agents already run on. One box, one place for the code, no second computer to keep in sync.</p></div>
-      <div><h3>Instead of cloud simulators</h3><p>Everything runs on your hardware. No per-minute bill, and your code never leaves the machine.</p></div>
-      <div><h3>Instead of Docker-OSX or OSX-KVM</h3><p>Those draw macOS in software unless you hand a whole GPU to the VM. macbox gets macOS onto your GPU while Linux keeps it.</p></div>
-    </div>
-    <p><a href="/guides/macbox-vs-docker-osx-and-osx-kvm/">The full comparison →</a></p>
+<section class="wrap band" id="compare">
+  <div class="head"><h2>Instead of a Mac, a cloud or a slow VM</h2></div>
+  <div class="cols3">
+    <div><h3>Instead of buying a Mac</h3><p>Use the Linux machine your agents already run on. One box, one copy of the code, no second computer to keep in sync.</p></div>
+    <div><h3>Instead of cloud simulators</h3><p>Everything runs on your hardware. No per-minute bill, and your code never leaves the machine.</p></div>
+    <div><h3>Instead of Docker-OSX or OSX-KVM</h3><p>Those draw macOS in software unless you hand a whole GPU to the VM. macbox gets macOS onto your GPU while Linux keeps it.</p></div>
   </div>
+  <p class="note"><a href="/guides/macbox-vs-docker-osx-and-osx-kvm/">The full comparison →</a></p>
 </section>
 
-<section class="band" id="get-started">
-  <div class="wrap split">
+<section class="wrap band" id="get-started">
+  <div class="split">
     <div>
-      <p class="kicker">Get started</p>
       <h2>Let your agent set it up</h2>
-      <p>macbox is written so an agent can do the whole install, the clicks in macOS's setup screens included. Give it this:</p>
-      <pre class="prompt"><code>Set up macbox on this machine: https://github.com/TUNA-NOPE/macbox. Follow its AGENTS.md and ask me before changing the host.</code></pre>
-      <p>It checks with you before it installs anything on the host, and needs two things from you: a macOS password, which you type into the VM's screen, and the Xcode download from Apple, which needs your Apple Account. Plan on an afternoon, mostly downloads and builds.</p>
+      <p class="muted">macbox is written so an agent can do the whole install, the clicks in macOS's setup screens included. Give it this:</p>
+<pre class="prompt"><code>Set up macbox on this machine: https://github.com/TUNA-NOPE/macbox. Follow its AGENTS.md and ask me before changing the host.</code></pre>
+      <p class="muted">It checks with you before it installs anything on the host, and needs two things from you: a macOS password, which you type into the VM's screen, and the Xcode download from Apple, which needs your Apple Account. Plan on an afternoon, mostly downloads and builds.</p>
       <p class="note">Or do it yourself: <code>./macbox next</code> always says what's done and what's next. <a href="/guides/run-macos-on-linux/">The walkthrough →</a></p>
     </div>
     <div>
@@ -165,19 +220,13 @@ description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine w
   </div>
 </section>
 
-<section class="band" id="guides">
-  <div class="wrap">
-    <header>
-      <p class="kicker">Guides</p>
-      <h2>Start from what you're trying to do</h2>
-    </header>
-    {{guides}}
-  </div>
+<section class="wrap band" id="guides">
+  <div class="head"><h2>Guides</h2><p>Start from what you're trying to do.</p></div>
+  {{guides}}
 </section>
 
-<section class="band" id="faq">
-  <div class="wrap read faq">
-    <p class="kicker">FAQ</p>
+<section class="wrap band" id="faq">
+  <div class="read faq">
     <h2>Questions people ask</h2>
     <details><summary>Can I run the iOS Simulator on Linux?</summary><p>Not by itself: it's part of Xcode, which needs macOS. macbox runs macOS in a VM on Linux with the GPU attached, so the real Simulator runs on your own machine, with no Mac, no cloud account and no per-minute bill.</p></details>
     <details><summary>How do I give Claude Code or Codex an iOS Simulator on a Linux server?</summary><p>Set up macbox, then run <code>macbox agents install</code>. Agents get <code>mac-sim</code> (a simulator per checkout: build, run, tap, screenshot, record), <code>sim-fps</code> (did that animation hold 60 fps?), and a skill that tells them when and how to use them. See <a href="/guides/ios-simulator-for-ai-coding-agents/">the agents guide</a>.</p></details>
@@ -190,20 +239,21 @@ description: macbox runs macOS, Xcode and iOS Simulators on your Linux machine w
   </div>
 </section>
 
-<section class="band" id="license">
-  <div class="wrap read">
+<section class="wrap band" id="license">
+  <div class="read">
     <div class="callout warn">
       <p><strong>Apple's license.</strong> macbox ships no Apple software. macOS, Xcode and the simulator runtimes download from Apple under Apple's terms, and you alone are responsible for complying with them. Apple's software license agreement for macOS allows it to run only on Apple-branded hardware; running it in a VM on other hardware breaches that agreement. macbox comes as is, with no warranty.</p>
     </div>
   </div>
-  <div class="wrap">
-    <div class="endcta">
-      <h2>Give your agents a Mac</h2>
-      <p>Hand your agent the repo and let it set up the rest.</p>
-      <div class="ctas end">
-        <a class="btn" href="#get-started">Get started</a>
-        <a class="btn ghost" href="https://github.com/TUNA-NOPE/macbox">GitHub <span aria-hidden="true">↗</span></a>
-      </div>
+</section>
+
+<section class="wrap band final">
+  <div class="panel dusk">
+    <h2>Give your agents a Mac</h2>
+    <p>Hand your agent the repo and let it set up the rest.</p>
+    <div class="ctas">
+      <a class="btn primary" href="#get-started">Get started</a>
+      <a class="btn" href="https://github.com/TUNA-NOPE/macbox">View on GitHub</a>
     </div>
   </div>
 </section>
