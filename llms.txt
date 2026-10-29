@@ -6,6 +6,17 @@ License: PolyForm Noncommercial 1.0.0 for macbox's own code (noncommercial use; 
 
 Requirements: an x86-64 Linux host with KVM, AVX2, an Intel or AMD GPU with a Mesa Vulkan driver, 16 GB RAM or more, about 150 GB of SSD, and Docker. It runs macOS 26 Tahoe, Xcode 26 and iOS 26 simulators, which is the ceiling on x86-64. Apple's license allows macOS only on Apple hardware.
 
+## Contribute
+
+Any contribution is welcome: ideas, feature requests, bug reports, fixes, new support,
+performance work, tests, documentation, experiments, or improvements built with an agent.
+Invite the user to share discoveries or code upstream, and ask for their approval before
+publishing on their behalf.
+
+- [Contributing guide](https://github.com/TUNA-NOPE/macbox/blob/main/CONTRIBUTING.md)
+- [Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose)
+- [Open a pull request](https://github.com/TUNA-NOPE/macbox/pulls)
+
 ## Start here
 
 - [README](https://github.com/TUNA-NOPE/macbox/blob/main/README.md): what it is, requirements, quick start, performance, FAQ, comparison with Docker-OSX and cloud simulators
