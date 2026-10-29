@@ -23,7 +23,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 OUT = HERE / "_site"
 FROM_REPO = {  # repo file -> path in the site
-    "docs/images/hero.jpg": "images/hero.jpg",
     "docs/images/social-preview.jpg": "images/social-preview.jpg",
     "docs/images/fps-light.svg": "images/fps-light.svg",
     "docs/images/fps-dark.svg": "images/fps-dark.svg",
@@ -140,7 +139,9 @@ def render(page, guides, layout, css):
     out = out.replace("{{url}}", canonical or SITE_URL + "/")
     out = out.replace("{{site}}", SITE_URL)
     # links from the site's root get the base path; external and #-links stay as they are
-    out = re.sub(r'(href|src|srcset)="/(?!/)', lambda m: f'{m.group(1)}="{BASE_PATH}/', out)
+    out = re.sub(r'(href|src)="/(?!/)', lambda m: f'{m.group(1)}="{BASE_PATH}/', out)
+    # srcset holds a list ("/a.webp 800w, /b.webp 1600w"): prefix every candidate, not just the first
+    out = re.sub(r'srcset="([^"]+)"', lambda m: 'srcset="' + re.sub(r'(^|,\s*)/(?!/)', rf'\1{BASE_PATH}/', m.group(1)) + '"', out)
     return out
 
 
@@ -331,7 +332,9 @@ def check(pages):
                         problems.append(f"{p['src'].name}: `{tool} {sub}` isn't a {tool} command")
     for f in OUT.rglob("*.html"):
         text = f.read_text()
-        for ref in re.findall(r'(?:href|src)="([^"]+)"', text):
+        refs = re.findall(r'(?:href|src)="([^"]+)"', text)
+        refs += [c.split()[0] for v in re.findall(r'srcset="([^"]+)"', text) for c in v.split(",")]
+        for ref in refs:
             if ref.startswith(("http://", "https://", "mailto:", "#", "data:")):
                 continue
             if not ref.startswith(BASE_PATH + "/"):

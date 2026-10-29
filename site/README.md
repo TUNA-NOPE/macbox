@@ -13,7 +13,7 @@ python3 site/build.py --serve   # the same, then http://127.0.0.1:8000/macbox/
 |---|---|
 | `pages/` | one HTML fragment per page. A header of `key: value` lines, then `---`. The file's path is the URL: `pages/guides/xcode-on-linux.html` is `/guides/xcode-on-linux/` |
 | `layout.html`, `style.css` | the frame around every page; the CSS is inlined |
-| `static/` | copied as is: the favicon, the IndexNow key, search engines' verification files, and WebP copies of `docs/images/hero.jpg` (`magick docs/images/hero.jpg -resize 800x -quality 80 site/static/images/hero-800.webp`, and the same at full size as `hero-1600.webp`; remake them when the picture changes) |
+| `static/` | copied as is: the favicon, the IndexNow key, search engines' verification files, and the home page's picture, made from `docs/images/hero.jpg` without its empty top 21 px: `magick docs/images/hero.jpg -crop 1600x923+0+21 +repage` then `-quality 82 hero-1600.webp`, `-resize 800x -quality 80 hero-800.webp` and `-quality 84 -interlace JPEG hero-1600.jpg` in `static/images/`; remake them when the picture changes) |
 
 The repo stays the source of truth. The guides answer one question each and link to `docs/` for the
 full reference; pictures (`docs/images`) and `llms.txt` are copied from the repo at build time, not
