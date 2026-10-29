@@ -1,25 +1,21 @@
 ---
-name: Feature request
-about: Suggest a new capability, integration, or configuration
+name: Feature or idea
+about: Request a feature or suggest any improvement
 title: ""
 labels: []
 assignees: []
 ---
 
-## What would you like macbox to do?
+## What would you like to change or add?
 
-Explain the feature or limitation in your own words.
+Describe the idea or desired outcome.
 
-## Why would it help?
+## Why would it be useful?
 
-What are you trying to accomplish? Who else might benefit?
+Share the use case or problem this would solve.
 
-## Have you tried something already? (optional)
+## Additional context (optional)
 
-Share a fork, patch, command, workaround, or reference if you have one.
+Links, prototypes, experiments, patches, examples, or anything else relevant.
 
-## Hardware / environment (if relevant)
-
-CPU, GPU, Linux distribution, driver, macbox commit.
-
-Ideas are welcome even if you don't have an implementation. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+No implementation required. All ideas are welcome. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
