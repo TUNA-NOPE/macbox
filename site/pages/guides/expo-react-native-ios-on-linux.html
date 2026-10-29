@@ -1,0 +1,76 @@
+title: Build and Test Expo and React Native iOS Apps on Linux
+short: Expo and React Native iOS on Linux
+description: Build an Expo or React Native iOS app on Linux and run it in the real iOS Simulator, with Metro and Fast Refresh on Linux, Release builds and Expo Go.
+kind: guide
+order: 4
+---
+<article class="wrap read article">
+<h1>Build and test Expo and React Native iOS apps on Linux</h1>
+<p class="lead">Expo and React Native let you write an iOS app on Linux, but building and running it needs Xcode, which needs macOS. With macbox, one command copies your checkout into a macOS VM on the same machine, builds it there with Xcode and CocoaPods, and opens it in a real iOS Simulator, while Metro keeps running on Linux.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li><code>mac-sim up && mac-sim run</code> from the app's checkout: a Debug build in the simulator, with Fast Refresh from Linux.</li>
+<li><code>MODE=release mac-sim run</code> for a Release build; <code>MODE=go mac-sim run</code> for Expo Go.</li>
+<li>The first build takes 2 to 15 minutes; later ones are incremental.</li>
+</ul>
+</div>
+
+<h2 id="before">Before you start</h2>
+<ul>
+<li>A macbox VM with Xcode and the simulator pool, and the agent tools installed: <a href="/guides/run-macos-on-linux/">macOS on Linux</a>, <a href="/guides/xcode-on-linux/">Xcode on Linux</a>, then <code>./macbox pool</code> and <code>./macbox agents install</code>.</li>
+<li>The app's dependencies installed on Linux too (<code>npm install</code>, <code>bun install</code>, …), because Metro runs there.</li>
+</ul>
+
+<h2 id="run">Run the app</h2>
+<pre><code>cd ~/code/my-app
+mac-sim up                    <span class="c"># claim a simulator for this checkout and boot it</span>
+mac-sim run                   <span class="c"># build on the Mac, install, open; Metro runs here</span>
+mac-sim shot /tmp/home.png    <span class="c"># look at it</span></code></pre>
+<p>What <code>mac-sim run</code> does:</p>
+<ol>
+<li>Copies the checkout to the Mac, without <code>node_modules</code>, <code>.git</code> and generated <code>ios/</code> and <code>android/</code> folders. Uncommitted changes are included; nothing needs to be pushed. A gitignored <code>.env</code> is copied too.</li>
+<li>Installs dependencies there with the project's package manager, and runs <code>expo prebuild</code> and <code>pod install</code> when the app config or dependencies changed.</li>
+<li>Builds with <code>xcodebuild</code> for that simulator (x86_64, since the VM is an Intel Mac), installs and opens the app.</li>
+<li>Starts Metro on Linux from your checkout. The app reaches it through an SSH tunnel, so saving a file updates the app by Fast Refresh.</li>
+</ol>
+<p>Run <code>mac-sim run</code> again after native changes: a new native dependency, a config plugin, <code>app.json</code>.</p>
+
+<h2 id="modes">Release builds and Expo Go</h2>
+<div class="table"><table>
+<thead><tr><th>Command</th><th>What you get</th></tr></thead>
+<tbody>
+<tr><th><code>mac-sim run</code></th><td>a Debug build with Metro on Linux and Fast Refresh</td></tr>
+<tr><th><code>MODE=release mac-sim run</code></th><td>a Release build with the JavaScript inside and no Metro: what users get. Check performance here; Debug builds and Expo Go add jank of their own</td></tr>
+<tr><th><code>MODE=go mac-sim run</code></th><td>the app in Expo Go, at the version matching the project's SDK, installed for you. Only for apps without custom native code</td></tr>
+</tbody>
+</table></div>
+
+<h2 id="projects">Other project shapes</h2>
+<ul>
+<li><strong>Bare React Native</strong> with its own <code>ios/</code> folder in git: built as it is, with <code>pod install</code> but no prebuild.</li>
+<li><strong>Monorepos</strong> with several apps: run from inside the app's folder, or set <code>APP_DIR</code>.</li>
+<li><strong>Old libraries</strong> that import React Native's old headers (<code>'RCTBridge.h' file not found</code>): <code>RN_FROM_SOURCE=1 mac-sim run</code> builds React Native from source, slower.</li>
+<li>Don't run <code>npx expo run:ios</code> on the Mac: it opens Simulator.app, which doubles the GPU's work for every simulator.</li>
+</ul>
+
+<h2 id="check">Check the UI, not just the build</h2>
+<pre><code>mac-sim snapshot               <span class="c"># the accessibility tree, refs like @e4</span>
+mac-sim ad press @e4           <span class="c"># tap; also fill, scroll, swipe, back...</span>
+mac-sim open myapp://settings  <span class="c"># a deep link</span>
+mac-sim record /tmp/flow.mp4 10 &
+mac-sim ad press @e4           <span class="c"># drive the flow while it records</span>
+wait; sim-fps /tmp/flow.mp4    <span class="c"># 60 fps and no dropped frames in every stretch?</span></code></pre>
+<p>Measure motion on the default 1x simulator; the 3x ones (<code>mac-sim up --sharp</code>) are for screenshots at a real iPhone's pixels. Need widgets, Live Activities, the Dynamic Island or push? <code>mac-sim up --full</code>. <code>mac-sim logs</code> shows the build, Metro and tunnel output when something fails.</p>
+
+<h2 id="android">Android from the same checkout</h2>
+<p><code>android-sim up && android-sim run</code> does the same with an Android emulator on the host, if the Android SDK is set up (<a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/agents.md#android">docs/agents.md</a>).</p>
+
+<h2 id="devices">Real phones and TestFlight</h2>
+<p><code>phone-build</code> (the <code>phone-builds</code> skill) makes an <code>.ipa</code> for an iPhone or TestFlight with your <code>eas.json</code> profiles. It uses Expo's free monthly EAS cloud builds first, then builds locally: iOS in the macbox VM, Android on the host. Signing for a device needs Apple's paid Developer Program. See <a href="https://github.com/TUNA-NOPE/macbox/blob/main/skills/phone-builds/SKILL.md">skills/phone-builds</a>.</p>
+
+<h2 id="done">When you're done</h2>
+<pre><code>mac-sim down    <span class="c"># stop Metro and free the simulator</span>
+mac-sim clean   <span class="c"># optional: delete this checkout's copy and build on the Mac (1 to 2 GB)</span></code></pre>
+</article>

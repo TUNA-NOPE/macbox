@@ -1,0 +1,75 @@
+title: iOS Simulators for AI Coding Agents and T3 Code
+short: iOS Simulators for AI agents
+description: Give Claude Code, Codex and T3 Code agents their own iOS Simulator on a Linux host: macbox's officially supported tools, skill and T3 Code Device panel.
+kind: guide
+order: 5
+---
+<article class="wrap read article">
+<h1>Running iOS Simulators with AI coding agents</h1>
+<p class="lead">An agent that changes an iOS screen should see it running, not guess from the code. macbox officially supports AI coding agents (Claude Code and Codex) and T3 Code: it gives every agent checkout its own iOS Simulator on your Linux machine, the commands to build, tap, screenshot and record it, a 60 fps check, and a skill that tells the agent when to use them.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li><code>./macbox agents install</code> installs <code>mac-sim</code>, <code>sim-fps</code>, <code>android-sim</code>, and the <code>simulators</code> skill for Claude Code and Codex.</li>
+<li><code>./macbox t3 register</code> and <code>./macbox t3 fix-hub</code> put the simulators in T3 Code's Device panel, streamed live.</li>
+<li>Each checkout gets its own simulator, so agents in parallel worktrees don't wait for each other.</li>
+</ul>
+</div>
+
+<h2 id="supported">What's supported</h2>
+<p>These integrations are part of macbox and maintained in its repository. "Supported" here means macbox's own support; macbox isn't affiliated with or endorsed by Anthropic, OpenAI or T3.</p>
+<div class="table"><table>
+<thead><tr><th>Tool</th><th>What macbox gives it</th></tr></thead>
+<tbody>
+<tr><th>Claude Code</th><td>the <code>simulators</code>, <code>phone-builds</code> and <code>macbox</code> skills in <code>~/.claude/skills</code>; a "Simulators" section in <code>~/.claude/CLAUDE.md</code>; an optional hook that reminds it of the skill when a prompt mentions a simulator</td></tr>
+<tr><th>Codex</th><td>the same skills in <code>~/.agents/skills</code>, and the same section in <code>~/.codex/AGENTS.md</code></td></tr>
+<tr><th>T3 Code</th><td>the VM as a device host in the Device panel (<code>macbox t3 register</code>), T3's device hub rebuilt for the Intel VM (<code>macbox t3 fix-hub</code>), and <code>mac-sim t3</code> to print the ids for <code>device_open</code></td></tr>
+<tr><th>Any agent with a shell</th><td><code>mac-sim</code>, <code>sim-fps</code> and <code>android-sim</code> are plain commands; the skill files are Markdown any agent can read</td></tr>
+</tbody>
+</table></div>
+
+<h2 id="install">Install</h2>
+<p>With a working macbox VM, Xcode and the pool (<a href="/guides/ios-simulator-on-linux/">iOS Simulator on Linux</a>):</p>
+<pre><code>./macbox agents install</code></pre>
+<p>It links <code>mac-sim</code>, <code>mac-sim-remote</code>, <code>sim-fps</code>, <code>android-sim</code>, <code>android-gpu-desktop</code>, <code>phone-build</code> and <code>macbox</code> into <code>~/.local/bin</code>; links the skills into <code>~/.claude/skills</code> and <code>~/.agents/skills</code>; writes the simulators section between <code>&lt;!-- macbox:simulators --&gt;</code> markers in <code>~/.claude/CLAUDE.md</code> and <code>~/.codex/AGENTS.md</code> (each backed up first); and enables the timer that shuts idle simulators down. <code>./macbox agents uninstall</code> removes the links and the timer.</p>
+
+<h2 id="loop">What an agent does with it</h2>
+<p>From the app's checkout:</p>
+<pre><code>mac-sim up                     <span class="c"># claim a simulator from the pool and boot it</span>
+mac-sim run                    <span class="c"># copy the checkout to the Mac, build, install, open; Metro on Linux</span>
+mac-sim snapshot               <span class="c"># the screen as an accessibility tree, refs like @e12</span>
+mac-sim ad press @e12          <span class="c"># tap (any agent-device command)</span>
+mac-sim shot /tmp/a.png        <span class="c"># a lossless screenshot to look at</span>
+mac-sim record /tmp/a.mp4 10 & <span class="c"># record while driving the flow...</span>
+wait; sim-fps /tmp/a.mp4       <span class="c"># ...then: 60 fps in every stretch of motion? dropped frames?</span>
+mac-sim down                   <span class="c"># give it back</span></code></pre>
+<p>The <a href="https://github.com/TUNA-NOPE/macbox/blob/main/skills/simulators/SKILL.md">simulators skill</a> is the agent's rulebook. After every UI change it runs the app, screenshots and looks, records the whole flow, and checks with <code>sim-fps</code> that motion held 60 fps with no dropped frames. It re-checks on a Release build (<code>MODE=release mac-sim run</code>) before calling the work done. <code>sim-fps</code> exits non-zero when a stretch drops frames, so the check is a pass or a fail, not an impression.</p>
+<div class="callout"><p>Measure motion on a 1x simulator (the default). On a modest GPU, 3x simulators can't reach 60 fps in heavy scenes, and that's the machine, not the app. On an Intel Arrow Lake iGPU a 1x simulator reached 92 to 96 fps in a heavy Liquid Glass benchmark.</p></div>
+
+<h2 id="parallel">Several agents at once</h2>
+<p><code>mac-sim</code> keys each simulator to a checkout's git root. Two agents in two worktrees get two simulators, and <code>mac-sim status</code> shows who holds what. The default pool has two slim simulators plus <code>full</code>, <code>sharp</code> and <code>small</code>. Simulators nobody has used for 20 minutes shut down on their own.</p>
+
+<h2 id="t3">T3 Code's Device panel</h2>
+<p><a href="https://github.com/pingdotgg/t3code">T3 Code</a> shows simulators and emulators in its Device panel, and its agents can call <code>device_open</code>, <code>device_screenshot</code> and <code>device_list</code>. iOS needs a Mac, which T3 reaches over SSH; macbox's VM is that Mac.</p>
+<pre><code>./macbox t3 register   <span class="c"># add the VM to T3's deviceHosts (settings backed up first)</span>
+                       <span class="c"># open T3's Device panel once: T3 installs its device hub on the Mac</span>
+./macbox t3 fix-hub    <span class="c"># rebuild the hub's native parts for the Intel VM</span>
+./macbox t3 status</code></pre>
+<p>T3's hub ships its native parts for Apple silicon only; <code>fix-hub</code> rebuilds them for x86-64 from the hub's own source, including a fix that makes the VM's software H.264 encoder deliver each frame at once. Run it again after T3 updates its hub. Then:</p>
+<ul>
+<li><code>mac-sim t3</code> prints <code>hostId=macbox deviceId=&lt;udid&gt;</code>; the agent passes them to <code>device_open</code>, and the user watches every tap live.</li>
+<li>On iOS the agent keeps driving with <code>mac-sim ad …</code>. Using the <code>agent-device</code> command <code>device_open</code> returns as well would start a second session on the same simulator, and the two refuse each other (<code>DEVICE_IN_USE</code>).</li>
+<li>From a tap to the first new frame on the stream: a median of 66 ms inside the Mac.</li>
+<li>Android emulators started with <code>android-sim</code> show up in the panel by themselves (<code>hostId</code> <code>local</code>, the serial from <code>android-sim serial</code>).</li>
+</ul>
+
+<h2 id="setup-agent">Letting an agent set up macbox itself</h2>
+<p>An agent can do the whole installation, including the steps inside macOS's GUI. It looks at the VM's screen with <code>./macbox screenshot</code> and acts with <code>click</code>, <code>type</code>, <code>key</code> and <code>wait</code>. Point it at <a href="https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md">AGENTS.md</a>: it lists the sequence and the ground rules, such as asking before changing the host and never handling the user's passwords or Apple Account.</p>
+
+<h2 id="android">Android and real phones</h2>
+<ul>
+<li><code>android-sim</code> has the same shape for Android emulators on the host: <code>up</code>, <code>run</code>, <code>snapshot</code>, <code>ad</code>, <code>shot</code>, <code>record</code>, <code>down</code>. It needs the Android SDK; see <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/agents.md#android">docs/agents.md</a>.</li>
+<li>The <code>phone-builds</code> skill and <code>phone-build</code> make an <code>.ipa</code>, a TestFlight upload or an <code>.apk</code>: Expo's free EAS cloud builds first, then locally (iOS in the VM). Device signing needs Apple's paid Developer Program.</li>
+</ul>
+</article>

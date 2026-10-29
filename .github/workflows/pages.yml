@@ -1,0 +1,59 @@
+# Builds the website (site/) and publishes it to GitHub Pages: https://tuna-nope.github.io/macbox/
+# Pull requests only build and check it; pushes to main deploy it, then tell IndexNow (Bing and
+# others) which pages exist. Google reads the sitemap through Search Console.
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
+  pull_request:
+    paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build and check
+        run: python3 site/build.py
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/_site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Submit the sitemap's URLs to IndexNow
+        continue-on-error: true
+        env:
+          SITE: https://tuna-nope.github.io/macbox
+          KEY: d0f80829b645869eb473963b6ad2dd95
+        run: |
+          sleep 30   # let the new deployment reach the CDN
+          urls=$(curl -fsS "$SITE/sitemap.xml" | grep -o '<loc>[^<]*' | sed 's/<loc>//' | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')
+          body=$(printf '{"host":"tuna-nope.github.io","key":"%s","keyLocation":"%s/%s.txt","urlList":%s}' "$KEY" "$SITE" "$KEY" "$urls")
+          curl -sS -o /dev/null -w 'IndexNow: HTTP %{http_code}\n' -X POST https://api.indexnow.org/indexnow \
+            -H 'Content-Type: application/json; charset=utf-8' -d "$body"

@@ -1,0 +1,210 @@
+title: macbox: macOS, Xcode and the iOS Simulator on Linux, GPU-accelerated
+description: macbox runs a full macOS VM in Docker on Linux with Metal on your own GPU, plus Xcode and a pool of iOS Simulators for AI coding agents. No Mac, no cloud.
+---
+<div class="wrap hero">
+  <p class="eyebrow">Open source · Linux host · macOS 26 guest</p>
+  <h1>macOS, Xcode and the iOS Simulator on Linux, drawn on your own GPU</h1>
+  <p class="lead">macbox runs a full macOS VM in Docker on a Linux machine, with Metal accelerated by the host's GPU through Reims vGPU. It installs Xcode and a pool of real iOS Simulators that you, or an AI coding agent such as Claude Code or Codex, can build on, run, tap, screenshot and measure at 60 fps. No Mac, no cloud service, no per-minute bill.</p>
+  <p class="supported"><span>Official support for</span> <b>Claude Code</b> <b>Codex</b> <b>T3 Code</b></p>
+  <div class="ctas">
+    <a class="btn primary" href="/guides/run-macos-on-linux/">Get started</a>
+    <a class="btn" href="https://github.com/TUNA-NOPE/macbox">View on GitHub <span aria-hidden="true">↗</span></a>
+    <a class="btn" href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/setup.md">Setup docs</a>
+  </div>
+  <figure class="shot">
+    <picture>
+      <source type="image/webp" srcset="/images/hero-800.webp 800w, /images/hero-1600.webp 1600w" sizes="(max-width: 1120px) calc(100vw - 48px), 1072px">
+      <img src="/images/hero.jpg" width="1600" height="944" fetchpriority="high" alt="The macOS 26 Tahoe desktop running in macbox on Linux, with two iOS 26.5 Simulators in front: a Liquid Glass benchmark and Safari showing a GitHub page">
+    </picture>
+    <figcaption>macOS 26 Tahoe in macbox on an Intel iGPU, with two of its iOS 26.5 Simulators: GlassBench, a Liquid Glass load, and Safari. The simulators' screens are composited onto the desktop's screenshot.</figcaption>
+  </figure>
+  <div class="facts">
+    <div><b>92–96 fps</b> <span>a 1x iOS Simulator under a heavy Liquid Glass load, on an Intel iGPU</span></div>
+    <div><b>macOS 26</b> <span>Tahoe, with Xcode 26 and iOS 26 Simulators</span></div>
+    <div><b>No passthrough</b> <span>Metal runs on the host's Vulkan driver; the host keeps its GPU</span></div>
+    <div><b>One CLI</b> <span><code>macbox</code> builds, installs and runs all of it</span></div>
+  </div>
+</div>
+
+<section class="band" id="features">
+  <div class="wrap">
+    <header>
+      <p class="kicker">What you get</p>
+      <h2>A real Mac toolchain on a Linux box</h2>
+      <p>Everything Xcode needs runs inside a genuine macOS guest. macbox adds the parts that make it fast and usable from Linux and from agents.</p>
+    </header>
+    <div class="grid">
+      <div><h3>macOS with Metal</h3><p><a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a> gives QEMU Apple's paravirtual GPU, so macOS's own driver works with no guest driver. <a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a> runs Metal's work on Vulkan.</p></div>
+      <div><h3>Xcode and its tools</h3><p><code>macbox xcode</code> installs the Xcode <code>.xip</code> you download from Apple, accepts the license and adds the iOS Simulator runtime. <code>xcodebuild</code> and CocoaPods run over SSH.</p></div>
+      <div><h3>A pool of iOS Simulators</h3><p>Slim 1x simulators for most work, a full one for widgets, Live Activities and the Dynamic Island, and a 3x one for real iPhone pixels.</p></div>
+      <div><h3>Built for AI coding agents</h3><p><code>mac-sim</code> gives each checkout its own simulator: build, run, tap, type, lossless screenshots and video. <code>sim-fps</code> checks a recording held 60 fps.</p></div>
+      <div><h3>The screen, anywhere</h3><p>A window on your Linux desktop with no encoding, or a browser tab (Selkies, H.264 on the GPU). Agents can see and click it too: <code>macbox screenshot</code>, <code>click</code>, <code>type</code>.</p></div>
+      <div><h3>T3 Code, Expo and Android</h3><p>Simulators stream live into T3 Code's Device panel. Expo and React Native apps build on the Mac with Metro on Linux. <code>android-sim</code> runs Android emulators on the host.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="agents">
+  <div class="wrap">
+    <header>
+      <p class="kicker">Official support</p>
+      <h2>Made for AI coding agents and T3 Code</h2>
+      <p>AI coding agents and T3 Code are first-class, officially supported in macbox: the integrations ship in the repository, are installed with one command, and are maintained with the rest of the project.</p>
+    </header>
+    <div class="grid">
+      <div><h3>Claude Code</h3><p>The <code>simulators</code>, <code>phone-builds</code> and <code>macbox</code> skills, a Simulators section in <code>CLAUDE.md</code>, and an optional hook that points it at the skill whenever a prompt mentions a simulator.</p></div>
+      <div><h3>Codex</h3><p>The same skills in <code>~/.agents/skills</code> and the same section in <code>~/.codex/AGENTS.md</code>, so Codex builds, taps, screenshots and measures the app on its own.</p></div>
+      <div><h3>T3 Code</h3><p><code>macbox t3 register</code> adds the VM to T3 Code's Device panel and <code>macbox t3 fix-hub</code> rebuilds T3's device hub for the Intel VM: the simulator streams live and takes taps, and agents open it with <code>device_open</code>.</p></div>
+    </div>
+<pre><code>./macbox agents install   <span class="c"># mac-sim, sim-fps, android-sim, the skills and instructions for Claude Code and Codex</span>
+./macbox t3 register      <span class="c"># the VM in T3 Code's Device panel (then: ./macbox t3 fix-hub)</span></code></pre>
+    <p>Every agent checkout gets its own simulator, and the skill's loop has the agent run the app, look at a screenshot, record the flow and check with <code>sim-fps</code> that it held 60 fps before calling a UI change done. <a href="/guides/ios-simulator-for-ai-coding-agents/">The agents and T3 Code guide →</a></p>
+    <p class="note">"Officially supported" is macbox's own commitment. macbox isn't affiliated with or endorsed by Anthropic, OpenAI or T3.</p>
+  </div>
+</section>
+
+<section class="band" id="how-it-works">
+  <div class="wrap split">
+    <div>
+      <p class="kicker">How it works</p>
+      <h2>One container, one VM, your GPU</h2>
+      <ol class="steps">
+        <li><strong>A container holds the whole stack.</strong> Ubuntu with Mesa, QEMU built with Reims vGPU, a headless compositor and the browser stream. It keeps nothing of its own; the VM lives on your disk.</li>
+        <li><strong>macOS draws with Metal.</strong> QEMU exposes Apple's paravirtual GPU. Reims vGPU answers it on the host, and metal2vulkan translates the Metal work to Vulkan on your Intel or AMD GPU.</li>
+        <li><strong>Everything else is SSH.</strong> After a short GUI install, Xcode, the simulator pool and the agent tools are set up with commands. <code>mac-sim</code> copies a checkout into macOS, builds it there and runs Metro on Linux.</li>
+      </ol>
+      <p><a href="/guides/gpu-accelerated-macos-vm-on-linux/">How the GPU path works, and why it needs no passthrough →</a></p>
+    </div>
+<pre class="diagram"><code>Linux host (KVM + a Vulkan GPU + Docker)
+└─ container macbox
+   └─ QEMU with Reims vGPU ──► metal2vulkan ──► Vulkan (Mesa) on your GPU
+      └─ macOS 26 Tahoe (x86-64), drawn with Metal
+         ├─ Xcode, CocoaPods, Node
+         ├─ iOS Simulators: a pool, one per agent checkout (mac-sim)
+         └─ T3 Code's device hub  ──► the Device panel, live</code></pre>
+  </div>
+</section>
+
+<section class="band" id="performance">
+  <div class="wrap">
+    <header>
+      <p class="kicker">Measured, not estimated</p>
+      <h2>Performance</h2>
+      <p>macbox builds Reims vGPU and metal2vulkan with its own patches. On the GPU they were measured on, they raised the iOS Simulator's frame rate 1.8 to 2.3 times over Reims as upstream shipped it.</p>
+    </header>
+    <figure class="chart">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="/images/fps-dark.svg">
+        <img src="/images/fps-light.svg" width="900" height="370" loading="lazy" alt="iOS Simulator frame rate in a Liquid Glass benchmark. 1x: 53.5 fps upstream, 94.2 with the macbox build. 2x: 33.5 and 64.2. 3x: 17.2 and 39.0.">
+      </picture>
+    </figure>
+    <div class="table"><table>
+      <thead><tr><th>Workload</th><th class="num">Reims 2ce3209, upstream</th><th class="num">macbox build (two runs)</th></tr></thead>
+      <tbody>
+        <tr><th>iOS Simulator 1x (402×874), Liquid Glass</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
+        <tr><th>iOS Simulator 2x (804×1748), Liquid Glass</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
+        <tr><th>iOS Simulator 3x (1206×2622, an iPhone's pixels)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
+        <tr><th>Safari at 3x, a page under a blurred floating bar</th><td class="num">n/a</td><td class="num">66.4 / 64.2 fps</td></tr>
+        <tr><th>macOS desktop, Genie minimize at 3440×1440</th><td class="num">~12 frames</td><td class="num">19.5 frames</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, a VM with 8 vCPUs and 12 GB. Frames counted at the simulator's own screen with no encoder in the way, after a warm-up, one simulator animating. The GPU is the limit: a 3x simulator keeps this iGPU 96 to 98% busy, so a faster GPU moves every number up. Other GPUs have not been measured yet. Method, patches and known limits: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
+  </div>
+</section>
+
+<section class="band" id="compare">
+  <div class="wrap">
+    <header>
+      <p class="kicker">Alternatives</p>
+      <h2>How it compares</h2>
+      <p>Docker-OSX and OSX-KVM also boot macOS in QEMU on Linux. Without a GPU passed through to the VM, macOS draws in software. macbox gives macOS Metal on the host's own GPU and adds tools built for agents.</p>
+    </header>
+    <div class="table"><table>
+      <thead><tr><th></th><th class="us">macbox</th><th>Docker-OSX, OSX-KVM</th><th>Cloud simulators</th><th>A Mac, or a remote Mac</th></tr></thead>
+      <tbody>
+        <tr><th>Runs on</th><td class="us">your Linux host</td><td>your Linux host</td><td>the provider's Macs</td><td>a Mac</td></tr>
+        <tr><th>Metal in macOS</th><td class="us">yes, on the host's GPU through Vulkan</td><td>only with a GPU passed through to the VM (VFIO)</td><td>yes</td><td>yes</td></tr>
+        <tr><th>Cost</th><td class="us">your hardware</td><td>your hardware</td><td>usually per minute or a plan</td><td>the Mac</td></tr>
+        <tr><th>Built for agents</th><td class="us">a simulator per checkout, screenshots, recordings, a 60 fps check, a skill</td><td>no</td><td>varies</td><td>with tools such as agent-device</td></tr>
+        <tr><th>Newest iOS Simulator</th><td class="us">26.x, the x86-64 ceiling</td><td>26.x</td><td>the newest</td><td>the newest</td></tr>
+        <tr><th>Apple's macOS license</th><td class="us">not on non-Apple hardware</td><td>not on non-Apple hardware</td><td>yes</td><td>yes</td></tr>
+      </tbody>
+    </table></div>
+    <p><a href="/guides/macbox-vs-docker-osx-and-osx-kvm/">macbox, Docker-OSX and OSX-KVM in detail →</a></p>
+  </div>
+</section>
+
+<section class="band" id="requirements">
+  <div class="wrap split">
+    <div>
+      <p class="kicker">Requirements</p>
+      <h2>What you need</h2>
+      <div class="table"><table>
+        <tbody>
+          <tr><th>CPU</th><td>x86-64 with VT-x or AMD-V, and AVX2</td></tr>
+          <tr><th>GPU</th><td>one with a Mesa Vulkan driver: <strong>Intel</strong> (measured on an Arrow Lake iGPU) or <strong>AMD</strong> (supported by Reims, untested here). NVIDIA works with Reims, but macbox's image doesn't ship NVIDIA's driver yet</td></tr>
+          <tr><th>RAM</th><td>16 GB or more (the VM takes 8 to 16)</td></tr>
+          <tr><th>Disk</th><td>about 150 GB free, on an SSD or NVMe</td></tr>
+          <tr><th>OS</th><td>Linux with KVM (<code>/dev/kvm</code>), a render node (<code>/dev/dri/renderD*</code>), and Docker (rootless is fine) or Podman</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">macOS for Intel ends with macOS 26 Tahoe, and Apple ships iOS 27's simulators for Apple silicon only. So macbox runs macOS 26, Xcode 26 and iOS 26 simulators: that is the ceiling on x86-64.</p>
+    </div>
+    <div id="quick-start">
+      <p class="kicker">Quick start</p>
+      <h2>Up in an afternoon</h2>
+<pre><code>git clone https://github.com/TUNA-NOPE/macbox && cd macbox
+./macbox init      <span class="c"># config, an SSH key, the ssh alias "macbox"</span>
+./macbox doctor    <span class="c"># checks KVM, the GPU, Docker, disk space</span>
+./macbox build     <span class="c"># Reims vGPU + metal2vulkan + QEMU (20 to 60 min)</span>
+./macbox create    <span class="c"># a VM; macOS downloads from Apple</span>
+./macbox up        <span class="c"># the screen: http://127.0.0.1:6081/</span>
+./macbox next      <span class="c"># what's done, and the next step</span></code></pre>
+      <p>Installing macOS takes a few steps in the VM's screen, then the rest is commands: <code>provision</code>, <code>xcode</code>, <code>pool</code>, <code>agents install</code>. Plan on two to three hours, mostly downloads and builds. An agent can do the whole setup, GUI steps included: point it at <a href="https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md">AGENTS.md</a>.</p>
+      <p><a href="/guides/run-macos-on-linux/">The full walkthrough →</a></p>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="guides">
+  <div class="wrap">
+    <header>
+      <p class="kicker">Guides</p>
+      <h2>Start from what you're trying to do</h2>
+    </header>
+    {{guides}}
+  </div>
+</section>
+
+<section class="band" id="faq">
+  <div class="wrap read faq">
+    <p class="kicker">FAQ</p>
+    <h2>Questions people ask</h2>
+    <details><summary>Can I run the iOS Simulator on Linux?</summary><p>Not by itself: it's part of Xcode, which needs macOS. macbox runs macOS in a VM on Linux with the GPU attached, so the real Simulator runs on your own machine, with no Mac, no cloud account and no per-minute bill.</p></details>
+    <details><summary>How do I give Claude Code or Codex an iOS Simulator on a Linux server?</summary><p>Set up macbox, then run <code>macbox agents install</code>. Agents get <code>mac-sim</code> (a simulator per checkout: build, run, tap, screenshot, record), <code>sim-fps</code> (did that animation hold 60 fps?), and a skill that tells them when and how to use them. See <a href="/guides/ios-simulator-for-ai-coding-agents/">the agents guide</a>.</p></details>
+    <details><summary>Is this Docker-OSX or OSX-KVM with GPU acceleration?</summary><p>Those boot macOS in QEMU too, but macOS gets Metal only when you pass a GPU it has drivers for through to the VM (VFIO), which takes that GPU away from the host. macbox uses Reims vGPU instead: Apple's own paravirtual GPU device, run on the host's Vulkan driver. The host keeps its GPU, macOS gets Metal, and an integrated GPU is enough.</p></details>
+    <details><summary>Can I build and run an Expo or React Native iOS app on Linux?</summary><p>Yes. <code>mac-sim run</code> copies the checkout into macOS, builds it with Xcode and CocoaPods, and installs it in the simulator. Metro runs on Linux, so JavaScript edits arrive by Fast Refresh. <a href="/guides/expo-react-native-ios-on-linux/">The Expo guide</a> covers Release builds and Expo Go.</p></details>
+    <details><summary>Does it work with T3 Code's Device panel?</summary><p>Yes: <code>macbox t3 register</code> adds the VM as a device host, and the simulators stream live into the panel and take taps.</p></details>
+    <details><summary>Real iPhones and TestFlight?</summary><p><code>phone-build</code> makes <code>.ipa</code> builds (Expo's free EAS cloud builds first, then locally in the VM) and uploads to TestFlight. Signing for devices needs Apple's paid Developer Program.</p></details>
+    <details><summary>What can't it do?</summary><p>Run macOS 27, Xcode 27 or iOS 27's simulators, which Apple ships for Apple silicon only. And it can't make running macOS on non-Apple hardware compliant with Apple's license: see below.</p></details>
+    <details><summary>Is it free?</summary><p>For noncommercial use, yes: macbox's own code is under the PolyForm Noncommercial License 1.0.0 (yourself, a hobby, research, teaching, a charity). Commercial use needs the author's permission: <a href="https://github.com/TUNA-NOPE/macbox/issues">open an issue</a> to ask.</p></details>
+  </div>
+</section>
+
+<section class="band" id="license">
+  <div class="wrap read">
+    <div class="callout warn">
+      <p><strong>Apple's license.</strong> macbox ships no Apple software. macOS, Xcode and the simulator runtimes download from Apple under Apple's terms, and you alone are responsible for complying with them. Apple's software license agreement for macOS allows it to run only on Apple-branded hardware; running it in a VM on other hardware breaches that agreement. macbox comes as is, with no warranty.</p>
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="endcta">
+      <h2>Give your Linux machine a Mac</h2>
+      <p>Clone the repo, run <code>./macbox next</code>, and follow it until every step is ticked.</p>
+      <div class="ctas end">
+        <a class="btn" href="/guides/run-macos-on-linux/">Read the walkthrough</a>
+        <a class="btn ghost" href="https://github.com/TUNA-NOPE/macbox">GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+    </div>
+  </div>
+</section>

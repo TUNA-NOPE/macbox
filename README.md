@@ -6,6 +6,9 @@ your Vulkan GPU), with Xcode, a pool of iOS Simulators, T3 Code's Device panel, 
 coding agents (Claude Code, Codex, T3 Code) need to build, run, drive and check iOS apps on their
 own. One command, `macbox`, sets it up and runs it.
 
+**Website and guides:** [tuna-nope.github.io/macbox](https://tuna-nope.github.io/macbox/): macOS, Xcode and
+the iOS Simulator on Linux, Expo apps, the GPU path, and AI coding agents with T3 Code.
+
 ![The macOS desktop in macbox, with two iOS 26.5 Simulators: a Liquid Glass benchmark at 1x and Safari](docs/images/hero.jpg)
 
 <sub>macOS 26 Tahoe's desktop in macbox on an Intel iGPU, with two of its iOS 26.5 Simulators in front
@@ -159,6 +162,7 @@ silicon only. It also can't run macOS legally on non-Apple hardware (see below).
 | [docs/troubleshooting.md](docs/troubleshooting.md) | when something doesn't work |
 | [guest/README.md](guest/README.md) | what runs inside macOS |
 | [patches/README.md](patches/README.md) | the patch series on Reims vGPU and metal2vulkan |
+| [site/](site/README.md) | the website's source: the guides at https://tuna-nope.github.io/macbox/guides/ |
 
 ## Credits
 

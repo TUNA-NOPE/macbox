@@ -1,0 +1,77 @@
+title: GPU-Accelerated macOS VM on Linux, Without GPU Passthrough
+short: GPU-accelerated macOS VM
+description: How macbox gives a macOS VM on Linux Metal acceleration on the host's own Intel or AMD GPU, with Reims vGPU and metal2vulkan instead of VFIO passthrough.
+kind: guide
+order: 6
+---
+<article class="wrap read article">
+<h1>A GPU-accelerated macOS VM on Linux, without GPU passthrough</h1>
+<p class="lead">macOS in QEMU usually means software rendering, unless you give the VM a whole GPU it has drivers for. macbox takes a different path: Apple's own paravirtual GPU device, answered on the host by Reims vGPU and translated from Metal to Vulkan. The host keeps its GPU, macOS gets Metal, and an integrated GPU is enough.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li>No VFIO, no second GPU, no guest driver: macOS's built-in driver talks to the paravirtual device.</li>
+<li>Works with a Mesa Vulkan driver: Intel (measured on Arrow Lake) or AMD (supported by Reims, untested with macbox).</li>
+<li>macbox's patches raised the iOS Simulator's frame rate 1.8 to 2.3 times on the measured GPU.</li>
+</ul>
+</div>
+
+<h2 id="problem">Why macOS VMs are usually slow</h2>
+<p>macOS draws its desktop, its apps and the iOS Simulator with Metal. In a QEMU VM with an emulated display adapter there is no Metal device, so everything falls back to software rendering. The common fix is VFIO passthrough: give the VM a physical GPU that macOS has drivers for. That takes the GPU away from the host, needs a card macOS has a driver for (recent NVIDIA cards have none), rarely works with an integrated GPU, and is fiddly to set up.</p>
+
+<h2 id="path">The path macbox uses</h2>
+<pre class="diagram"><code>macOS 26 (guest): Metal ──► Apple's paravirtual GPU driver (built in)
+   │  apple-gfx-pci device in QEMU
+   ▼
+Reims vGPU (host) ──► metal2vulkan ──► Vulkan (Mesa: ANV for Intel, RADV for AMD) ──► your GPU</code></pre>
+<ul>
+<li><strong><a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a></strong> implements, on the host, the device Apple uses for its own virtual machines (<code>apple-gfx-pci</code>). macOS ships a driver for it, so the guest needs nothing installed.</li>
+<li><strong><a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a></strong> executes the Metal command streams that arrive at that device on Vulkan.</li>
+<li><strong>The display</strong>: Reims draws each guest display into its own window. macbox puts it in a headless compositor and streams it with Selkies (H.264 on the GPU), or opens it directly on your Wayland desktop. QEMU's VNC is never used: it reads every frame back from the GPU and manages 2 to 3 frames a second.</li>
+</ul>
+<p>Reims vGPU, metal2vulkan, reims-util and their QEMU fork are the work of Anees Iqbal (<a href="https://github.com/steelbrain">steelbrain</a>). macbox builds them from pinned commits, applies its patches, and runs them in a container.</p>
+
+<h2 id="patches">What macbox's patches change</h2>
+<p>On every GPU measured so far the GPU is the bottleneck, so what matters is how much extra work translation adds per frame. Before the patches, most of it was copies: macOS's framebuffer and the simulator's display surface live in guest RAM, and metal2vulkan copied each into a GPU image and back around every render pass. Those shadow copies were 51% of all GPU time with the simulator and 67% with the desktop. The patch series renders those textures in place, adds Arrow Lake-specific device facts, and a file of live switches for experiments. Details: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/patches/README.md">patches/README.md</a>.</p>
+
+<h2 id="results">Results</h2>
+<p>Intel Core Ultra 7 265 (Arrow Lake iGPU), Mesa 26.2.4, macOS 26.7.1, iOS 26.5, 8 vCPUs and 12 GB. GlassBench is a table scrolling under Liquid Glass bars and a floating glass toolbar; frames counted at the simulator's screen, two runs each.</p>
+<div class="table"><table>
+<thead><tr><th>Workload</th><th class="num">Reims 2ce3209</th><th class="num">Reims 7198fe6</th><th class="num">macbox build</th></tr></thead>
+<tbody>
+<tr><th>Simulator 1x (402×874)</th><td class="num">53.5</td><td class="num">57.0</td><td class="num"><strong>95.8 / 92.5</strong></td></tr>
+<tr><th>Simulator 2x (804×1748)</th><td class="num">33.5</td><td class="num">37.6</td><td class="num"><strong>67.8 / 60.5</strong></td></tr>
+<tr><th>Simulator 3x (1206×2622)</th><td class="num">17.2</td><td class="num">19.2</td><td class="num"><strong>38.5 / 39.5</strong></td></tr>
+<tr><th>Safari at 3x, blurred floating bar</th><td class="num">n/a</td><td class="num">39.5</td><td class="num"><strong>66.4 / 64.2</strong></td></tr>
+</tbody>
+</table></div>
+<p class="note">Frames per second. A Genie minimize on a 3440×1440 desktop went from about 12 to 19.5 frames per animation. At 1x the GPU spends 8.0 ms per frame; at 3x, 25.0 ms. Measure your own GPU with the tools in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/bench/README.md">bench/</a>.</p>
+
+<h2 id="gpus">Which GPUs</h2>
+<div class="table"><table>
+<thead><tr><th>GPU</th><th>Status</th></tr></thead>
+<tbody>
+<tr><th>Intel (Mesa ANV)</th><td>measured: an Arrow Lake iGPU. The Arrow Lake facts are set only on Arrow Lake PCI ids; other Intel GPUs use in-place rendering where its per-memory-kind check passes</td></tr>
+<tr><th>AMD (Mesa RADV)</th><td>supported by Reims, untested with macbox. Needs <code>/dev/udmabuf</code></td></tr>
+<tr><th>NVIDIA</th><td>works with Reims, but macbox's image doesn't ship NVIDIA's driver yet</td></tr>
+</tbody>
+</table></div>
+
+<h2 id="tuning">Settings that matter</h2>
+<ul>
+<li><strong>Simulator scale.</strong> 1x simulators are 4 to 9 times cheaper than 3x. macbox's pool is mostly 1x.</li>
+<li><strong>Desktop resolution and refresh.</strong> 1920×1080 costs about half of 3440×1440; <code>MACBOX_REFRESH=60</code> keeps macOS from asking for 100 or 120 Hz.</li>
+<li><strong>Simulator.app closed.</strong> It doubles the GPU's work.</li>
+<li><strong>CPU pinning</strong> on hybrid CPUs (<code>MACBOX_CPUSET</code>), and the VM's disk on NVMe (<code>./macbox disk nvme</code>).</li>
+<li><code>MACBOX_GPU_TUNING=off</code> turns macbox's runtime GPU tuning off; <code>./macbox build --upstream</code> builds Reims as upstream ships it, for comparison.</li>
+</ul>
+
+<h2 id="limits">Known limits</h2>
+<ul>
+<li><strong>Animations start about 0.1 s late on an idle display:</strong> macOS's driver for this device sends no vblank while nothing presents (<a href="https://github.com/steelbrain/reims-vgpu/issues/141">reims-vgpu#141</a>).</li>
+<li><strong>3x is GPU-bound</strong> at about 35 to 40 fps in heavy Liquid Glass scenes on this iGPU.</li>
+<li><strong>Tried without gain:</strong> answering as an Intel or AMD Mac GPU, compressed heap textures, newer Mesa, hugepages (impossible: Reims maps guest RAM in 16 KiB views). The full list is in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</li>
+</ul>
+<p>To set it up, follow <a href="/guides/run-macos-on-linux/">How to run macOS on Linux</a>.</p>
+</article>

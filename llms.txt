@@ -26,3 +26,16 @@ Requirements: an x86-64 Linux host with KVM, AVX2, an Intel or AMD GPU with a Me
 - [Patches](https://github.com/TUNA-NOPE/macbox/blob/main/patches/README.md)
 - [Troubleshooting](https://github.com/TUNA-NOPE/macbox/blob/main/docs/troubleshooting.md)
 - [Credits](https://github.com/TUNA-NOPE/macbox/blob/main/CREDITS.md)
+
+## Website
+
+The same project as a website, with task guides. Each page has a Markdown copy at `index.md` in the same folder.
+
+- [Overview](https://tuna-nope.github.io/macbox/index.md): what macbox is, features, measured performance, comparison, requirements, quick start
+- [How to run macOS on Linux with GPU acceleration](https://tuna-nope.github.io/macbox/guides/run-macos-on-linux/index.md)
+- [How to run Xcode on Linux](https://tuna-nope.github.io/macbox/guides/xcode-on-linux/index.md)
+- [iOS Simulator on Linux](https://tuna-nope.github.io/macbox/guides/ios-simulator-on-linux/index.md)
+- [Expo and React Native iOS apps on Linux](https://tuna-nope.github.io/macbox/guides/expo-react-native-ios-on-linux/index.md)
+- [iOS Simulators for AI coding agents: Claude Code, Codex, T3 Code](https://tuna-nope.github.io/macbox/guides/ios-simulator-for-ai-coding-agents/index.md)
+- [GPU-accelerated macOS VM on Linux, without passthrough](https://tuna-nope.github.io/macbox/guides/gpu-accelerated-macos-vm-on-linux/index.md)
+- [macbox vs Docker-OSX and OSX-KVM](https://tuna-nope.github.io/macbox/guides/macbox-vs-docker-osx-and-osx-kvm/index.md)

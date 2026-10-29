@@ -1,0 +1,65 @@
+title: How to Run Xcode on Linux
+short: Xcode on Linux
+description: Xcode needs macOS, but you can run the real Xcode 26 on a Linux machine inside a GPU-accelerated macOS VM. Install it, build with xcodebuild over SSH.
+kind: guide
+order: 2
+---
+<article class="wrap read article">
+<h1>How to run Xcode on Linux</h1>
+<p class="lead">There is no Xcode for Linux, and no Linux tool that replaces it for iOS: building, signing and simulating Apple apps needs Apple's SDKs, which run on macOS. What you can do is run macOS itself on your Linux machine, and the real Xcode inside it. This guide does that with macbox.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li>Set up a macOS VM with macbox (<a href="/guides/run-macos-on-linux/">guide</a>).</li>
+<li>Download Xcode 26's <code>.xip</code> from Apple, then <code>./macbox xcode ~/Downloads/Xcode_26.6.xip</code>.</li>
+<li>Build from Linux with <code>ssh macbox xcodebuild …</code>, or use Xcode's window in the VM's screen.</li>
+</ul>
+</div>
+
+<h2 id="options">Your options</h2>
+<div class="table"><table>
+<thead><tr><th>Option</th><th>Xcode version</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><th>A Mac, or a rented remote Mac</th><td>the newest</td><td>the supported route; costs the Mac or a monthly fee</td></tr>
+<tr><th>A cloud CI or simulator service</th><td>the newest</td><td>billed per minute or by plan; your code and builds leave your machine</td></tr>
+<tr><th>A macOS VM on Linux (macbox)</th><td>Xcode 26</td><td>your own hardware, GPU-accelerated; macOS 26 is the x86-64 ceiling; outside Apple's license on non-Apple hardware</td></tr>
+</tbody>
+</table></div>
+<p>Cross-compiling Swift on Linux works for server-side Swift and command-line tools, but it doesn't give you UIKit, SwiftUI, the iOS SDK, Interface Builder or the Simulator.</p>
+
+<h2 id="version">Which Xcode runs</h2>
+<p>Xcode 26, with iOS 26 Simulators. macbox's macOS guest is x86-64, and macOS 26 Tahoe is the last macOS for Intel. Apple ships macOS 27, Xcode 27 and iOS 27's simulators for Apple silicon only, so they can't run on an x86-64 Linux host. macbox is used day to day with Xcode 26.6 and iOS 26.5.</p>
+
+<h2 id="install">Install Xcode</h2>
+<ol>
+<li><strong>Set up the VM</strong> as in <a href="/guides/run-macos-on-linux/">How to run macOS on Linux</a>, through <code>./macbox provision</code>. You need <code>ssh macbox</code> working.</li>
+<li><strong>Download Xcode's <code>.xip</code></strong> from <a href="https://developer.apple.com/download/all/">developer.apple.com/download/all</a>. Any free Apple Account can sign in there. macbox never handles your Apple ID, so this one step is yours, on the host.</li>
+<li><strong>Install it:</strong>
+<pre><code>./macbox xcode ~/Downloads/Xcode_26.6.xip
+./macbox xcode     <span class="c"># afterwards: the version, license and first-launch status</span></code></pre>
+It copies the file into the VM, expands and installs it, selects it with <code>xcode-select</code>, accepts the license, runs the first launch, and adds the iOS Simulator runtime. Expect 30 to 60 minutes.</li>
+</ol>
+
+<h2 id="build">Build from Linux</h2>
+<p>The VM is an SSH host named <code>macbox</code>, so Xcode's command-line tools are one hop away:</p>
+<pre><code>ssh macbox xcodebuild -version
+ssh macbox xcrun simctl list devices available</code></pre>
+<p>Copy a project in with <code>rsync</code> or <code>git clone</code> it on the Mac, then run <code>xcodebuild</code> as you would on a Mac. For Expo and React Native apps, <code>mac-sim run</code> does the copy, the CocoaPods install, the build and the install into a simulator for you, with Metro on Linux: see <a href="/guides/expo-react-native-ios-on-linux/">the Expo guide</a>.</p>
+<p>To use Xcode's own window, open the VM's screen at <code>http://127.0.0.1:6081/</code> or run <code>./macbox view local</code>. Xcode draws with Metal on your GPU like the rest of macOS.</p>
+
+<h2 id="simulators">Simulators and devices</h2>
+<ul>
+<li><code>./macbox pool</code> creates a small pool of iOS Simulators tuned for the VM, mostly at 1x pixels, which is 4 to 9 times cheaper to draw than 3x. See <a href="/guides/ios-simulator-on-linux/">iOS Simulator on Linux</a>.</li>
+<li>Keep Simulator.app closed when you can. It opens a window per booted simulator and doubles the GPU's work; <code>mac-sim</code> and T3 Code read the simulator's screen directly.</li>
+<li>For an <code>.ipa</code> on a real iPhone or TestFlight, the <code>phone-build</code> tool builds in the VM (after Expo's free EAS cloud builds). Signing for devices needs Apple's paid Developer Program.</li>
+</ul>
+
+<h2 id="faq">Common questions</h2>
+<h3>Do I need an Apple Account inside macOS?</h3>
+<p>No. Setup Assistant can skip it. You only sign in at developer.apple.com, in your own browser, to download the <code>.xip</code>.</p>
+<h3>Is it fast enough to use?</h3>
+<p>On an Intel Arrow Lake iGPU, a 1x iOS Simulator renders a heavy Liquid Glass scene at 92 to 96 fps. Builds use the VM's vCPUs (8 in that setup); a first Expo build takes 2 to 15 minutes and later builds are incremental. Other hardware hasn't been measured yet.</p>
+<h3>Is it legal?</h3>
+<p>Apple's macOS license allows macOS only on Apple-branded hardware, so running it in a VM on a PC breaches that agreement. macbox ships no Apple software, and compliance with Apple's terms is your responsibility.</p>
+</article>

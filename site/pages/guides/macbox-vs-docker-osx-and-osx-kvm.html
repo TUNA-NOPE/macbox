@@ -1,0 +1,52 @@
+title: macbox vs Docker-OSX and OSX-KVM: macOS on Linux with GPU
+short: macbox vs Docker-OSX and OSX-KVM
+description: How macbox compares with Docker-OSX, OSX-KVM, cloud simulators and a real Mac for running macOS, Xcode and the iOS Simulator on Linux, GPU included.
+kind: guide
+order: 7
+---
+<article class="wrap read article">
+<h1>macbox vs Docker-OSX and OSX-KVM</h1>
+<p class="lead">Docker-OSX and OSX-KVM are the well-known ways to run macOS on Linux, and macbox stands on the same foundation: QEMU, KVM and OpenCore. The difference is the GPU, and what the VM is for. macbox gives macOS Metal on the host's own GPU without passthrough, and it is built around Xcode, the iOS Simulator and AI coding agents.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li>Pick <strong>macbox</strong> to develop and test iOS apps on a Linux machine, with Metal on an Intel or AMD GPU you keep using on the host, and with agent tooling.</li>
+<li>Pick <strong>Docker-OSX or OSX-KVM</strong> for a range of macOS versions, a GPU you can pass through, or a general-purpose macOS VM.</li>
+<li>Pick <strong>a Mac or a cloud service</strong> for the newest Xcode and iOS, or where Apple's license must be met.</li>
+</ul>
+</div>
+
+<h2 id="table">Side by side</h2>
+<div class="table"><table>
+<thead><tr><th></th><th class="us">macbox</th><th>Docker-OSX, OSX-KVM</th><th>Cloud simulators</th><th>A Mac, or a remote Mac</th></tr></thead>
+<tbody>
+<tr><th>Runs on</th><td class="us">your Linux host</td><td>your Linux host</td><td>the provider's Macs</td><td>a Mac</td></tr>
+<tr><th>Metal in macOS</th><td class="us">yes, on the host's GPU through Vulkan</td><td>only with a GPU passed through to the VM</td><td>yes</td><td>yes</td></tr>
+<tr><th>The host keeps its GPU</th><td class="us">yes</td><td>not with passthrough</td><td>n/a</td><td>n/a</td></tr>
+<tr><th>macOS versions</th><td class="us">macOS 26 Tahoe</td><td>a range of releases</td><td>the provider's</td><td>the Mac's</td></tr>
+<tr><th>Newest iOS Simulator</th><td class="us">26.x, the x86-64 ceiling</td><td>26.x</td><td>the newest</td><td>the newest</td></tr>
+<tr><th>Xcode and simulators set up for you</th><td class="us">yes: <code>macbox xcode</code>, <code>macbox pool</code></td><td>by hand</td><td>yes</td><td>by hand</td></tr>
+<tr><th>Built for agents</th><td class="us">a simulator per checkout, screenshots, recordings, a 60 fps check, a skill, T3 Code's Device panel</td><td>no</td><td>varies</td><td>with tools such as agent-device</td></tr>
+<tr><th>Cost</th><td class="us">your hardware</td><td>your hardware</td><td>usually per minute or a plan</td><td>the Mac</td></tr>
+<tr><th>Apple's macOS license</th><td class="us">not on non-Apple hardware</td><td>not on non-Apple hardware</td><td>yes</td><td>yes</td></tr>
+</tbody>
+</table></div>
+
+<h2 id="gpu">The GPU difference</h2>
+<p>Docker-OSX and OSX-KVM give macOS an emulated display adapter. macOS has no Metal driver for it, so the desktop, Xcode and the iOS Simulator draw in software, unless you pass a physical GPU through with VFIO. Passthrough needs a card macOS has drivers for, and that card then belongs to the VM, not the host.</p>
+<p>macbox gives QEMU Apple's paravirtual GPU device through <a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a>. macOS's built-in driver talks to it, and <a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a> runs the Metal work on the host's Vulkan driver. On an Intel Arrow Lake iGPU, that is enough for a 1x iOS Simulator to render a heavy Liquid Glass scene at 92 to 96 fps. <a href="/guides/gpu-accelerated-macos-vm-on-linux/">How it works, with measurements.</a></p>
+
+<h2 id="scope">The scope difference</h2>
+<p>Docker-OSX and OSX-KVM aim to boot macOS, across many versions, for whatever you need it for. macbox does less and goes further along one path: macOS 26, then Xcode, a pool of simulators tuned for a VM (mostly 1x, with background services trimmed), Metro on Linux for Expo and React Native, T3 Code's Device panel, and <code>mac-sim</code> and <code>sim-fps</code> for agents. One CLI, <code>macbox</code>, runs it, and <code>macbox next</code> always says what's left to do.</p>
+
+<h2 id="when-not">When macbox isn't the right tool</h2>
+<ul>
+<li>You need Xcode 27, iOS 27 Simulators or anything newer: Apple ships those for Apple silicon only. Use a Mac or a cloud service.</li>
+<li>You need an older macOS release, or a GPU passed through for other reasons: Docker-OSX or OSX-KVM.</li>
+<li>Your host has only an NVIDIA GPU: macbox's image doesn't ship NVIDIA's driver yet.</li>
+<li>You need to stay within Apple's macOS license: it allows macOS only on Apple-branded hardware.</li>
+<li>Commercial use: macbox's own code is under the PolyForm Noncommercial License, so commercial use needs the author's permission.</li>
+</ul>
+<p>Ready to try it? <a href="/guides/run-macos-on-linux/">How to run macOS on Linux with macbox</a>.</p>
+</article>
