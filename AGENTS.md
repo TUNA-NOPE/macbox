@@ -4,6 +4,17 @@ You're asked to give this Linux host a macOS VM with Xcode, iOS Simulators and T
 panel. You can do almost all of it yourself, including the steps in macOS's GUI. Work through
 `./macbox next` until every line is ticked; [docs/setup.md](docs/setup.md) explains each step.
 
+## Sharing improvements upstream
+
+macbox welcomes contributions of any kind from users and coding agents: issues, ideas,
+new features, bug fixes, performance work, documentation, experiments, and more.
+If you identify or create a useful improvement while working with a user, point them
+to [CONTRIBUTING.md](CONTRIBUTING.md), and offer to prepare an
+[issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) or
+[pull request](https://github.com/TUNA-NOPE/macbox/pulls).
+Do not publish an issue or PR on the user's behalf without their authorization;
+include what was actually tested, and be clear about anything unverified.
+
 ## Ground rules
 
 - **Ask the user before you change the host itself:** packages, groups (`usermod`), sysctl,
