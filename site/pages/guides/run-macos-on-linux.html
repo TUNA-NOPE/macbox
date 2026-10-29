@@ -1,0 +1,92 @@
+title: How to Run macOS on Linux with GPU Acceleration
+short: Run macOS on Linux
+description: Run macOS 26 Tahoe in a VM on a Linux host with KVM, QEMU and Metal on your own GPU, step by step with macbox: requirements, install, daily use.
+kind: guide
+order: 1
+---
+<article class="wrap read article">
+<h1>How to run macOS on Linux with GPU acceleration</h1>
+<p class="lead">macOS runs well in a KVM virtual machine on Linux. The usual catch is graphics: without a GPU passed through to the VM, macOS draws in software, and anything built on Metal is slow or broken. macbox solves that with Reims vGPU, and wraps the whole setup in one command-line tool.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li>You need an x86-64 Linux host with KVM, AVX2, an Intel or AMD GPU with a Mesa Vulkan driver, 16 GB of RAM, about 150 GB of SSD, and Docker.</li>
+<li><code>./macbox init</code>, <code>doctor</code>, <code>build</code>, <code>create</code>, <code>up</code>, then a short install in the VM's screen. <code>./macbox next</code> always prints the next step.</li>
+<li>The result is macOS 26 Tahoe with Metal on your GPU, reachable as <code>ssh macbox</code> and as a window or browser tab.</li>
+</ul>
+</div>
+
+<h2 id="how">How it works</h2>
+<p>macbox runs QEMU inside a Docker container, with KVM for the CPU. Booting macOS on a PC goes through OpenCore, which reims-ctl sets up. The part that is different from other macOS-on-Linux setups is the GPU:</p>
+<ul>
+<li><a href="https://github.com/steelbrain/reims-vgpu">Reims vGPU</a> gives QEMU Apple's paravirtual GPU device (<code>apple-gfx-pci</code>). macOS already has a driver for it, so no guest driver is needed.</li>
+<li><a href="https://github.com/steelbrain/metal2vulkan">metal2vulkan</a> runs the Metal work that device receives on Vulkan, through Mesa on your GPU.</li>
+<li>The host keeps its GPU. Nothing is passed through, and an integrated GPU is enough.</li>
+</ul>
+<p>macbox builds both from pinned commits with its own patches, which made the iOS Simulator 1.8 to 2.3 times faster on the GPU they were measured on. <a href="/guides/gpu-accelerated-macos-vm-on-linux/">The GPU guide</a> explains the path in detail.</p>
+
+<h2 id="requirements">Requirements</h2>
+<div class="table"><table>
+<tbody>
+<tr><th>CPU</th><td>x86-64 with VT-x or AMD-V, and AVX2</td></tr>
+<tr><th>GPU</th><td>Intel (measured: Arrow Lake iGPU) or AMD (supported by Reims, untested here), with a Mesa Vulkan driver. macbox's image doesn't ship NVIDIA's driver yet</td></tr>
+<tr><th>RAM</th><td>16 GB or more; the VM takes 8 to 16</td></tr>
+<tr><th>Disk</th><td>about 150 GB free on an SSD or NVMe</td></tr>
+<tr><th>Software</th><td>KVM (<code>/dev/kvm</code>), a render node (<code>/dev/dri/renderD*</code>), Docker (rootless works well) or Podman (untested)</td></tr>
+</tbody>
+</table></div>
+<p>The guest is macOS 26 Tahoe. Apple's last macOS for Intel is 26, so that is also the newest macOS that runs on x86-64.</p>
+<div class="callout warn"><p>Apple's software license agreement for macOS allows it to run only on Apple-branded hardware. Running it in a VM on other hardware breaches that agreement. macbox ships no Apple software; macOS downloads from Apple, and complying with Apple's terms is up to you.</p></div>
+
+<h2 id="host">1. Prepare the host</h2>
+<p>Your user needs to open <code>/dev/kvm</code> and the GPU's render node, and Reims needs a much higher <code>vm.max_map_count</code> than the default 65530:</p>
+<pre><code>sudo usermod -aG kvm,render $USER        <span class="c"># then log in again</span>
+echo vm.max_map_count=2097152 | sudo tee /etc/sysctl.d/60-macbox.conf && sudo sysctl --system</code></pre>
+<p>With more than one GPU, choose the render node in the config (<code>MACBOX_RENDER_NODE</code>). An AMD GPU also needs access to <code>/dev/udmabuf</code>.</p>
+
+<h2 id="build">2. Configure, check and build</h2>
+<pre><code>git clone https://github.com/TUNA-NOPE/macbox ~/macbox && cd ~/macbox
+./macbox init      <span class="c"># ~/.config/macbox/macbox.env, an SSH key, a "Host macbox" alias</span>
+./macbox doctor    <span class="c"># fix every FAIL; WARN lines are advice</span>
+./macbox build     <span class="c"># the image, then Reims vGPU + metal2vulkan + QEMU: 20 to 60 minutes, ~25 GB</span></code></pre>
+<p><code>init</code> sizes the VM for your machine (half the cores, a third of the RAM, within limits). Look at <code>~/.config/macbox/macbox.env</code> before you build: the resolution, CPU pinning for hybrid CPUs, and where everything is stored (<code>MACBOX_HOME</code>) are all set there.</p>
+
+<h2 id="install">3. Create the VM and install macOS</h2>
+<pre><code>./macbox create          <span class="c"># the newest macOS 26 Tahoe, through Apple's recovery image</span>
+./macbox boot-picker on  <span class="c"># OpenCore's boot menu, needed for one Recovery step</span>
+./macbox up</code></pre>
+<p>Open the screen at <code>http://127.0.0.1:6081/</code> in a browser on the host, or run <code>./macbox view local</code> from a Wayland desktop on the host for a window with no encoding at all. Then, in the VM:</p>
+<ol>
+<li>In Recovery, open <strong>Disk Utility</strong>, choose View › Show All Devices, and erase <strong>QEMU HARDDISK Media</strong> as APFS with a GUID partition map.</li>
+<li>Choose <strong>Reinstall macOS</strong> and install onto that disk. It downloads macOS from Apple and restarts a few times (30 to 60 minutes).</li>
+<li>When Setup Assistant or a broken desktop appears, restart the VM (<code>./macbox down && ./macbox up</code>), choose <strong>Recovery</strong> in OpenCore's menu, open Utilities › Terminal, and run <code>./macbox recovery-fix</code> on the host. It sets the Metal error mode macOS 26 needs under Reims.</li>
+<li>Go through Setup Assistant: skip the Apple Account and create an administrator named <code>dev</code>.</li>
+<li>Open Terminal in macOS and run <code>./macbox ssh-bootstrap</code> on the host. Then <code>ssh macbox sw_vers</code> should answer.</li>
+</ol>
+<p>Each of these steps is spelled out, with what to do when one goes wrong, in <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/setup.md">docs/setup.md</a>. An AI agent can do them too: it sees the screen with <code>./macbox screenshot</code> and acts with <code>click</code>, <code>type</code> and <code>key</code> (<a href="https://github.com/TUNA-NOPE/macbox/blob/main/AGENTS.md">AGENTS.md</a>).</p>
+
+<h2 id="finish">4. Finish over SSH</h2>
+<pre><code>./macbox down && ./macbox disk nvme && ./macbox boot-picker off && ./macbox up
+./macbox provision                            <span class="c"># passwordless sudo, no sleep, Node, Ruby + CocoaPods</span>
+./macbox xcode ~/Downloads/Xcode_26.6.xip     <span class="c"># optional: Xcode and the iOS Simulator runtime</span>
+./macbox pool                                 <span class="c"># optional: the iOS Simulator pool</span>
+./macbox agents install                       <span class="c"># optional: mac-sim, sim-fps and the skills</span></code></pre>
+<p>Moving the system disk to NVMe makes small reads about a third faster and app launches up to twice as fast. <code>./macbox next</code> ticks off each step as it's done.</p>
+
+<h2 id="daily">Day to day</h2>
+<pre><code>./macbox up | down | status
+./macbox ssh                       <span class="c"># a shell on the Mac</span>
+./macbox logs qemu                 <span class="c"># or selkies, sway</span>
+./macbox resolution 2560x1440      <span class="c"># macOS's screen size (restarts a running VM)</span>
+./macbox backup before-update      <span class="c"># a copy of the disk, with the VM stopped</span></code></pre>
+<p>To watch from another machine, forward the port (<code>ssh -L 6081:127.0.0.1:6081 &lt;host&gt;</code>) or publish it on a private tailnet. The stream has no password of its own, so never expose it on the open internet.</p>
+
+<h2 id="limits">Limits</h2>
+<ul>
+<li>macOS 26 is the ceiling on x86-64; macOS 27 and iOS 27's simulators are Apple silicon only.</li>
+<li>NVIDIA GPUs aren't supported by macbox's image yet. AMD should work through Reims, but hasn't been tested with macbox.</li>
+<li>An idle macOS display gets no vblank from its driver, so the first frame of an animation starts about 0.1 s late (<a href="https://github.com/steelbrain/reims-vgpu/issues/141">reims-vgpu#141</a>).</li>
+</ul>
+<p>When something doesn't work, start with <code>./macbox doctor</code> and <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/troubleshooting.md">docs/troubleshooting.md</a>.</p>
+</article>

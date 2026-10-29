@@ -1,0 +1,79 @@
+title: iOS Simulator on Linux: Run the Real Simulator Locally
+short: iOS Simulator on Linux
+description: Run Apple's real iOS 26 Simulator on a Linux host, GPU-accelerated, with no Mac or cloud service: a simulator pool, mac-sim commands and frame rates.
+kind: guide
+order: 3
+---
+<article class="wrap read article">
+<h1>iOS Simulator on Linux</h1>
+<p class="lead">The iOS Simulator is part of Xcode, and Xcode needs macOS, so there is no native Linux version. Web-based "iOS emulators" only imitate the look. To run the real Simulator with your own app on a Linux machine, run macOS in a VM with the GPU attached, and the Simulator inside it. macbox does that, and gives you a command, <code>mac-sim</code>, to drive it from Linux.</p>
+{{meta}}
+<div class="tldr">
+<h2>In short</h2>
+<ul>
+<li>macbox runs macOS 26 with Xcode on your Linux host; the Simulator draws with Metal on your GPU.</li>
+<li><code>./macbox pool</code> makes five simulators tuned for the VM; <code>mac-sim up</code> claims one per checkout.</li>
+<li>On an Intel Arrow Lake iGPU, a 1x simulator renders a heavy Liquid Glass scene at 92 to 96 fps.</li>
+</ul>
+</div>
+
+<h2 id="setup">Set it up</h2>
+<p>You need a macbox VM with Xcode (<a href="/guides/run-macos-on-linux/">macOS on Linux</a>, then <a href="/guides/xcode-on-linux/">Xcode on Linux</a>). Then, on the host:</p>
+<pre><code>./macbox pool             <span class="c"># create the simulator pool in macOS</span>
+./macbox agents install   <span class="c"># mac-sim, sim-fps, android-sim in ~/.local/bin, the idle timer</span></code></pre>
+
+<h2 id="pool">The pool</h2>
+<p>Instead of many default simulators, macbox keeps a small pool built for a VM. Each one is named <code>&lt;iPhone&gt; (macbox &lt;kind&gt;)</code>, for example <code>iPhone 17 Pro (macbox slim 1)</code>.</p>
+<div class="table"><table>
+<thead><tr><th>Kind</th><th>Pixels</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><th><code>slim-1</code>, <code>slim-2</code></th><td>1x</td><td>most work. About 170 background iOS services are off (about 0.6 GB of memory instead of about 2), and it animates fastest</td></tr>
+<tr><th><code>full</code></th><td>1x</td><td>widgets, Live Activities, the Dynamic Island, push notifications: every iOS service runs</td></tr>
+<tr><th><code>sharp</code></th><td>3x</td><td>screenshots at a real iPhone's pixels</td></tr>
+<tr><th><code>small</code></th><td>3x</td><td>small-phone layouts (the "e" iPhone)</td></tr>
+</tbody>
+</table></div>
+<p>The 1x simulators have the same layout in points as a real iPhone with a quarter of 2x's pixels, which is why they are the default. Use the 3x ones for stills, not for judging frame rates.</p>
+
+<h2 id="use">Use it</h2>
+<p>Run <code>mac-sim</code> from inside an app's checkout. Each checkout (git root) gets its own simulator and keeps it until <code>down</code>, so parallel worktrees don't wait for each other.</p>
+<pre><code>mac-sim up                  <span class="c"># claim a slim simulator and boot it (--full, --sharp, --small)</span>
+mac-sim run                 <span class="c"># build the app on the Mac, install and open it; Metro runs here</span>
+mac-sim snapshot            <span class="c"># the screen as an accessibility tree, refs like @e12</span>
+mac-sim ad press @e12       <span class="c"># tap; any agent-device command</span>
+mac-sim open myapp://path   <span class="c"># a deep link</span>
+mac-sim shot /tmp/home.png  <span class="c"># a lossless screenshot, copied to Linux</span>
+mac-sim record /tmp/a.mp4 10   <span class="c"># 10 s of video</span>
+sim-fps /tmp/a.mp4          <span class="c"># fps and dropped frames per stretch of motion</span>
+mac-sim status              <span class="c"># every simulator and who holds it</span>
+mac-sim down                <span class="c"># give it back</span></code></pre>
+<p><code>mac-sim install path/To.app</code> installs any simulator build, and <code>mac-sim mac '&lt;command&gt;'</code> runs a shell command on the Mac with <code>$UDID</code> set to your simulator, so plain <code>xcrun simctl</code> works too.</p>
+
+<h2 id="see">See the screen</h2>
+<ul>
+<li><strong>Screenshots and recordings</strong> from <code>mac-sim shot</code> and <code>record</code> arrive on Linux, at the simulator's own pixels.</li>
+<li><strong>T3 Code's Device panel</strong> streams the simulator live and takes taps: <code>./macbox t3 register</code>, then <code>./macbox t3 fix-hub</code>. <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/t3-code.md">docs/t3-code.md</a> has the details.</li>
+<li><strong>The macOS desktop</strong> in a browser tab (<code>http://127.0.0.1:6081/</code>) or a local window, if you want Simulator.app. Keep it closed otherwise: it opens a window per simulator and doubles the GPU's work.</li>
+</ul>
+
+<h2 id="performance">How fast it is</h2>
+<p>Measured with GlassBench, a table scrolling under Liquid Glass bars and a floating glass toolbar, counted at the simulator's own screen, on an Intel Core Ultra 7 265 (Arrow Lake iGPU) with Mesa 26.2.4, macOS 26.7.1 and iOS 26.5:</p>
+<div class="table"><table>
+<thead><tr><th>Simulator</th><th class="num">Reims upstream (2ce3209)</th><th class="num">macbox build</th></tr></thead>
+<tbody>
+<tr><th>1x (402×874)</th><td class="num">53.5 fps</td><td class="num"><strong>95.8 / 92.5 fps</strong></td></tr>
+<tr><th>2x (804×1748)</th><td class="num">33.5 fps</td><td class="num"><strong>67.8 / 60.5 fps</strong></td></tr>
+<tr><th>3x (1206×2622)</th><td class="num">17.2 fps</td><td class="num"><strong>38.5 / 39.5 fps</strong></td></tr>
+</tbody>
+</table></div>
+<p>The GPU sets the ceiling: a 3x simulator keeps that iGPU 96 to 98% busy. Simulators animating at the same time share it. Recording uses the VM's software H.264 encoder, about 50 fps with one simulator animating. Full method: <a href="https://github.com/TUNA-NOPE/macbox/blob/main/docs/performance.md">docs/performance.md</a>.</p>
+
+<h2 id="limits">Limits</h2>
+<ul>
+<li>iOS 26 Simulators are the newest on x86-64; iOS 27's simulators are Apple silicon only.</li>
+<li>Simulator resolutions are fixed once created; pick a different pool simulator instead.</li>
+<li>Don't restart CoreSimulatorService while simulators run: it shuts down every one of them.</li>
+<li>Pool simulators idle for 20 minutes (no <code>mac-sim</code> command, no viewer) are shut down by a timer.</li>
+</ul>
+<p>Next: <a href="/guides/expo-react-native-ios-on-linux/">build an Expo or React Native app</a>, or <a href="/guides/ios-simulator-for-ai-coding-agents/">hand the simulator to an AI coding agent</a>.</p>
+</article>
