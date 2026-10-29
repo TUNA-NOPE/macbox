@@ -1,55 +1,44 @@
 # Contributing to macbox
 
-Using macbox on hardware or in a setup we haven't tested? Found a workaround, optimized a
-shader path, built an integration, or have an idea to make it better? **Please share it.**
-You don't need a finished patch to be helpful.
+**Everyone is welcome to improve macbox.** Whether you use it yourself, experiment with
+it, or work with an AI coding agent, we'd love to see what you discover and build.
+There is no preferred type of contribution: feature requests, new capabilities or
+compatibility, performance improvements, bug reports and fixes, documentation, tests,
+workarounds, experiments, and suggestions are all welcome.
 
-## Ideas, requests and experiments
+You don't need to have the complete solution. A useful idea, a reproducible problem,
+or a partial implementation is enough to start a conversation.
 
-[Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) for a feature
-request, question, bug, or hardware report. Ideas we especially want to hear about include:
+## Open an issue
 
-- AMD and NVIDIA GPU compatibility and driver setup.
-- Optional VFIO / GPU passthrough support (not currently built into macbox).
-- Alternative VM, display, streaming, and input configurations.
-- Measurable performance or reliability improvements.
-- Xcode, iOS Simulator, Expo, and coding-agent workflows.
+[Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) to report a problem,
+request a feature, suggest a change, or share an experiment. Describe what you want
+or encountered, why it matters, and any relevant steps, evidence, or environment details.
+Include as much as you know; incomplete reports are still welcome.
 
-If you made a fork that works with a dedicated GPU or passthrough, tell us how. A link to a
-branch, patch, or proof of concept is useful even if you haven't packaged it into a PR yet.
-For larger changes, it's worth discussing the design in an issue first.
+## Send a pull request
 
-## Share hardware results
+If you already fixed or improved something, please
+[open a pull request](https://github.com/TUNA-NOPE/macbox/pulls).
+Make your change on a branch or fork, explain what it does and why it helps, and include
+the tests or checks you ran. If you haven't been able to test part of it, just say so.
 
-Use the [hardware report template](https://github.com/TUNA-NOPE/macbox/issues/new/choose),
-including as much as you know:
+Small PRs are welcome. Larger changes can benefit from an issue first, but discussing
+them in advance isn't required. Please avoid breaking existing workflows without
+explanation, and document user-facing changes. Submissions are reviewed before merging;
+not every proposal can be accepted.
 
-- Host CPU, GPU(s), RAM, and whether the GPU is shared with Linux or passed through.
-- Linux distribution, kernel, Mesa or vendor driver, Docker/Podman, and macbox version/commit.
-- Guest macOS/Xcode/iOS Simulator versions, if relevant.
-- What works, what fails, and how to reproduce it (commands, config changes, logs).
-- If claiming a performance improvement, the before/after numbers, workload, resolution and
-  measurement method.
+## Working with a coding agent
 
-An incomplete report is still welcome. Please remove tokens, keys, personal information,
-and serial numbers from logs or screenshots before posting them.
+Agents are welcome to read, work on, and suggest improvements to macbox. If an agent
+identifies a bug, makes a fix, improves performance, or adds a feature, please consider
+sharing the result upstream, with your permission. Agent-assisted PRs should explain
+what changed and what was actually verified, just like any other PR.
 
-## Pull requests
+Do not share credentials, personal information, or confidential logs. Contributed code
+and assets must be yours to submit. macbox's own code and documentation use the
+[PolyForm Noncommercial License](LICENSE); upstream patches under
+[`patches/`](patches/README.md) retain their separate licenses. Do not include
+Apple software or other proprietary binaries.
 
-[Fork macbox](https://github.com/TUNA-NOPE/macbox/fork), make a focused change on a branch,
-and [open a pull request](https://github.com/TUNA-NOPE/macbox/pulls). Please explain the
-problem, how your change addresses it, and what you actually tested. If you couldn't test
-on a particular GPU or host, say so: untested support shouldn't be presented as verified.
-
-Keep the default Reims vGPU workflow working. Hardware-specific alternatives should be
-optional and documented, not silently change existing installations. Small fixes, docs,
-tests and experimental prototypes are all welcome, but merging depends on review and
-maintainability.
-
-macbox's own code and documentation use the
-[PolyForm Noncommercial License](LICENSE). Changes to upstream components under
-[`patches/`](patches/README.md) retain those components' separate licenses.
-Please only submit code and assets you have permission to contribute, and do not include
-Apple software or proprietary binaries in a PR.
-
-Thanks for making macbox useful beyond its original test machine.
+Thanks for contributing, whatever the size or topic.
