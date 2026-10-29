@@ -86,7 +86,7 @@ pre .c, .c { color: #8e8e93; }
 .logo { display: block; flex-shrink: 0; }
 @media (prefers-color-scheme: dark) { .logo path[fill="#111"] { fill: #2c2c2e; } }
 .shot { margin: clamp(56px, 7vw, 88px) auto 0; max-width: 1248px; padding-inline: clamp(12px, 3vw, 24px); }
-.shot img { display: block; width: 100%; height: auto; border-radius: clamp(8px, 1.2vw, 16px); background: #2a2f8a;
+.shot img { display: block; width: 100%; height: auto; border-radius: clamp(6px, .8vw, 10px); background: #2a2f8a;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .06), 0 2px 6px rgba(0, 0, 0, .06), 0 40px 90px -40px rgba(20, 24, 70, .55); }
 .shot figcaption, figure.chart figcaption { font-size: 13px; color: var(--ink3); margin-top: 18px; }
 
