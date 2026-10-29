@@ -147,25 +147,21 @@ silicon only. It also can't run macOS legally on non-Apple hardware (see below).
 | Newest iOS Simulator | 26.x (the x86-64 ceiling) | 26.x | the newest | the newest |
 | Apple's macOS license | not on non-Apple hardware | not on non-Apple hardware | yes | yes |
 
-## Contribute and help macbox support more hardware
+## Contributions welcome
 
-macbox has been measured mainly on an Intel Arrow Lake iGPU. If you get it running on another
-GPU or Linux setup, find a faster path, or make it work for a workflow we haven't considered,
-**we'd love to hear about it**. Even a hardware report or an experimental fork can help.
+**macbox is open to ideas, fixes, and improvements of every kind.** If you're using it and
+find a bug, have a feature request, add support for something new, make it faster, improve
+the docs, or build your own enhancement, please share it. Big changes, small fixes,
+experimental solutions, and reports of what didn't work are all valuable.
 
-In particular, if you've tried **AMD or NVIDIA GPUs, GPU passthrough (VFIO), alternative VM
-or display setups, or improvements to the iOS Simulator workflow**, share what worked and what
-didn't. GPU passthrough isn't a built-in macbox mode today; proposals for optional support
-are welcome, without replacing the default Reims vGPU path.
+[Open an issue](https://github.com/TUNA-NOPE/macbox/issues/new/choose) to report a problem,
+suggest an idea, or share your findings. If you've already built a solution,
+[open a pull request](https://github.com/TUNA-NOPE/macbox/pulls) so we can review it
+for inclusion. You don't need a finished implementation to start a conversation.
 
-[Request a feature or share hardware results](https://github.com/TUNA-NOPE/macbox/issues/new/choose)
-· [Open a pull request](https://github.com/TUNA-NOPE/macbox/pulls)
-· [Read the contribution guide](CONTRIBUTING.md)
-
-For a larger change, opening an issue first makes it easier to discuss the approach. A useful
-report includes your CPU/GPU, Linux and driver versions, what you changed, and enough steps
-for someone else to reproduce the result. You don't need a perfect solution to start a
-conversation; contributions will be reviewed for compatibility, maintenance and licensing.
+**Using an AI coding agent?** Contributions from agent-assisted workflows are welcome too.
+If your agent finds a problem or creates a useful improvement, ask it to prepare an
+issue or PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for a few simple guidelines.
 
 ## Docs
 
