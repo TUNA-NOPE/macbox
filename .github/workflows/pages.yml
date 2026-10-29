@@ -5,7 +5,7 @@ name: Website
 
 on:
   push:
-    branches: [main]
+    branches: [main, site/github-pages]   # TEMPORARY: publish from this PR branch before merge; remove before merging
     paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
   pull_request:
     paths: ["site/**", "docs/images/**", "llms.txt", "macbox", "sims/bin/mac-sim", ".github/workflows/pages.yml"]
