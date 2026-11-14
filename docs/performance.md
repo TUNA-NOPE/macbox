@@ -287,7 +287,7 @@ interleaved against the grid alone:
 | scrolling: p95 / p99 interval | 27.5-28.6 / 39-61 ms | 24.7-26.5 / 35-44 ms |
 | scrolling: repeated frames in 20 s | 95-138 | 11-17 |
 | a small animation alone (2 rounds): distinct frames a second | 57.3-57.5 | 56.4-56.9 |
-| the capture's CPU while scrolling | ~1.3 cores | ~0.9 |
+| the capture's CPU while scrolling, of one core | 105-134% | 82-93% |
 
 The rest of the gap to 60 is composites that pass while the capture holds the surface: its lock (~5 ms p50) and
 reading the rows it hashes, where each page the CPU touches comes back from the GPU.
