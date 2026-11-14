@@ -13,7 +13,7 @@ earlier "cohwl" build (2026-11-05). None of it is upstream yet.
 Most of the new code sits behind a switch and does nothing until it is set. What macbox turns on
 is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 
-## metal2vulkan (on `development` at 0db5825a), 99 patches
+## metal2vulkan (on `development` at 0db5825a), 100 patches
 
 | Patches | What they do |
 |---|---|
@@ -35,11 +35,12 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0094 a refused arm is a read | QEMU's census keeps held pages read-only (QEMU 0007), so a page it refuses to arm was being read and holds no write. metal2vulkan took it as the guest's, from before that change, and the next held batch copied its older bytes in over a draw still running (`overwrite_risk`, the write-loss gate). It is now only synced and counted (`refused_reads`). Found when a Device panel capture, reading the simulator's screen every frame, tripped the gate in production on 2026-11-13 |
 | 0095 an attachment the device makes no image of | A color attachment without RenderTarget usage renders through a stand-in in its own Vulkan format; ANV renders no compressed format (BC, ETC2, EAC, ASTC, PVRTC carriers) and no RGB9E5, so the image query failed, was read as limits of 0, and the pass was refused ("MaxImageDimension2D available 0"), which Reims aborts on: QEMU died this way in production on 2026-11-14, after a 1024x1024 ASTC texture. Formats the device renders through an integer word (RGB9E5, R8/RG8 sRGB, packed 16-bit) now get a stand-in in that word's format. A compressed color attachment gets no encoder (nil, which Reims skips) and an `m2v-compressed-attachment:` line naming the pass; the nil comes after every color's own checks and then the command buffer's state (an open encoder or a commit still refuse it, as any pass), and before any image is made; the pass's other attachments are then neither drawn nor stored. An unsupported combination is refused `Format` naming the Metal pixel format, as Reims reads it, not a size, and an `m2v-unmade-image:` line gives the whole combination. An all-format sweep on ANV: 171 such refusals before, 0 after |
 | 0096–0099 held groups and read traps | All off. 0096 `group_wake=1`: with `group_keep=1`, the scheduler's sleep ends at a kept group's deadline, not at the next completion. 0097 `surface_coherent_trap_wait=1`: a CPU read that traps on a Coherent surface waits until no running GPU write covers that surface, then syncs. Without it, a read can take finished frames' pages beside a frame still being drawn, and tear at a page boundary. A unit test shows both: frames [1,2] without it, [2,2] with it. In production it never waited once in 6,222 census reports, and screenshots still tore with it (1 in 90), so it stays off ([performance.md](../../docs/performance.md#tried-no-gain)). 0098 and 0099 (diagnostics): `group_hold_log_us=N` writes one `m2v long-hold:` line for each group held N µs or more. The line gives the scheduler's passes and wakings meanwhile, and the holding pass's CPU time, run-queue wait, sleeps, preemptions, and its wait for the `VkQueue` lock and use under it |
+| 0100 `uses_sorted` | `Submission::uses_sorted` and `CommandBuffer::uses_sorted`: a submission's check against a sorted list of objects, done by binary search instead of a scan for each resource. Reims 0034 uses it. |
 | 0085 `inline_lazy`, 0092 `inline_checks` | a lazy surface's first pass instance recorded inline; a batch's submission checks run in the scheduler's pass. On with Coherent |
 | 0062, 0068, 0076, 0077, 0080, 0081, 0083, 0084, 0086, 0090 experiments | `xr_unused_bits_off`, `surface_coherent_writer_wins`, `M2V_FLAT_TILE`, `shared_ccs`, `host_mutable`, `batch_end_light`, `view_render_direct`, `precise_barriers`, `checks_first`: live switches, all off. Most are in [docs/performance.md](../../docs/performance.md#tried-no-gain) |
 | 0047, 0048, 0052–0057, 0063–0067, 0071–0075, 0078, 0079, 0082, 0086–0089, 0091 diagnostics | the pass timer's units and censuses, logs of views, twins, barriers and the scheduler, counters of why shadows copy back, and `M2V_PENDING_AUDIT` (command buffers begun while their submission is pending). Off unless their variable is set |
 
-## Reims vGPU (on 7198fe6), 33 patches
+## Reims vGPU (on 7198fe6), 35 patches
 
 | Patches | What they do |
 |---|---|
@@ -60,6 +61,7 @@ is in [docs/performance.md](../../docs/performance.md#gpu-tuning-switches).
 | 0029 render lowering and multi-queue tests | `REIMS_VGPU_RENDER_LOWERING` (off) and regression tests for several queues |
 | 0030 `REIMS_VGPU_PAGED_BUFFER_BY_PAGES` | finds kept paged buffers by their guest pages; off |
 | 0031–0033 staged page-ups | `REIMS_VGPU_STAGED_PAGE_UP`, `REIMS_VGPU_STAGED_ZERO`: a new texture's first page-up copies its pages into a staging buffer (one copy per run) when no live view covers them, and pages of zeros write nothing. Before, each page run took its own mapping: 55k a second and a storm of TLB shootdowns; the simulator went from 89 to 101 fps. On with Coherent |
+| 0034, 0035 the detach check | Every submission is checked, on metal2vulkan's scheduler thread, against the objects detached now. That list is now made once per change (a detach, an attach or a release), sorted, and asked by binary search (metal2vulkan 0100). Before, it was made again for every check and scanned: 18–24% of that thread's time. On by default. Live `detached_sorted=0` brings back the check as before, for an A/B in one boot. Measured: 1 simulator +3.5%, 3 simulators +5.3% ([performance.md](../../docs/performance.md#several-simulators-at-once-and-the-desktop-under-load)). |
 
 ## QEMU (`vendor/qemu` at bd95509, github.com/steelbrain/qemu-reims-vgpu), 14 patches
 
