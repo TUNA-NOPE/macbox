@@ -270,13 +270,28 @@ with p95 intervals of 29-34 ms. A per-frame trace of the capture placed the loss
 Every composite differs from the one before. Liquid Glass redraws the lower third of the screen on each one
 while the app draws at 60, so the grid samples a 60 Hz picture through a ~100 Hz irregular source and aliases.
 Two things that did not help: deduplicating whole frames, which never fires, and a 120 Hz guest display, where
-the simulator composited ~70 a second in one sample (the stream then reached 54-57 distinct).
+the simulator composited ~70 a second in one sample (the stream then reached 54-57 distinct). Writing frames on
+an even 16.7 ms grid after a fixed 30 ms delay centred the median interval but left the p95 and added latency.
 
 What helped was choosing composites by what changed. The capture hashes the framebuffer in 16x32 tiles and copies
-a composite only when the app's part of the screen changed. Tiles that change on every composite (the glass) are
-ignored; a composite in which half the intermittently changing tiles changed is a new app frame. That gave 53-54
-distinct frames a second against 46-49, a fifth of the repeats, p95 29 ms against 32-34, and a quarter of a Mac
-core less (2 interleaved rounds). It is an Atlas patch to Simlock's capture for now, not part of macbox.
+a composite only when the app's part of the screen changed: a tile changed that did not change on the composite
+before, or half the intermittently changing tiles did. Tiles that change on every composite (the glass) are
+ignored, but only while composites come faster than the app draws. With nothing scrolling, the simulator
+composites at the app's 60, a small animation changes the same tiles every time, and an earlier version that
+treated those as glass halved the stream. Measured through the Hub on the scheduler fix (metal2vulkan 0100),
+interleaved against the grid alone:
+
+| | Grid only | Grid and tile selection |
+|---|---|---|
+| scrolling (3 rounds): distinct app frames a second | 51.8-54.6 | 55.2-57.0 |
+| scrolling: p95 / p99 interval | 27.5-28.6 / 39-61 ms | 24.7-26.5 / 35-44 ms |
+| scrolling: repeated frames in 20 s | 95-138 | 11-17 |
+| a small animation alone (2 rounds): distinct frames a second | 57.3-57.5 | 56.4-56.9 |
+| the capture's CPU while scrolling | ~1.3 cores | ~0.9 |
+
+The rest of the gap to 60 is composites that pass while the capture holds the surface: its lock (~5 ms p50) and
+reading the rows it hashes, where each page the CPU touches comes back from the GPU.
+It is an Atlas patch to Simlock's capture for now, not part of macbox.
 
 ## Tried, no gain
 
