@@ -75,6 +75,28 @@ behind the simulators' earlier work; that, not the desktop's own cost, is its la
 These runs placed the VM's vCPUs on the CPU's performance cores and QEMU's other threads on all
 cores (`MACBOX_CPUSET` pins all of QEMU instead).
 
+**The scheduler thread (2026-11-14).** metal2vulkan submits all the guest's GPU work from one thread.
+A profile of that thread in production (a ptrace sampler that stops only that thread, unwound
+offline) showed where its time goes:
+- 36–50%: `vkQueueSubmit`. ANV on i915 puts every `VkDeviceMemory` of the device into every execbuf.
+  QEMU holds ~7,000, nearly all of them guest buffers imported one by one. On this host that costs
+  0.27 µs per object for each submit with nothing else running, 2.1 ms at 8,000 objects. 89% of it is
+  kernel time.
+- 18–24%: Reims's check of each submission against the detached objects. It made a list for every
+  check and scanned it.
+
+Reims 0034 and metal2vulkan 0100 make that list once per change, sorted, and ask it by binary search.
+In one boot, interleaved, 6 runs of 20 s per arm, GlassBench at 3x:
+
+| | fps | scheduler thread CPU (user/sys, % of a core) | groups held ≥ 5 ms |
+|---|---|---|---|
+| 1 simulator, the check as before (`detached_sorted=0`) | 114.3 ± 0.8 | 27.1 / 16.9 | 0 |
+| 1 simulator, 0034 + 0100 | **118.4 ± 0.3** (+3.5%) | 22.1 / 19.3 | 2 (5.3 ms) |
+| 3 simulators, as before | 95.3 ± 1.6 in total | 23.6 / 12.8 | 19 (p90 10.8 ms) |
+| 3 simulators, 0034 + 0100 | **100.3 ± 2.1** (+5.3%) | 19.4 / 13.8 | 11 (p90 8.5 ms) |
+
+Screenshots: 0 tears in 30 per arm. Coherent's gates ok, no GPU hang.
+
 ### Earlier measurements, the 2026-10-28 build
 
 | | Reims 2ce3209 (2026-10-26) | Reims 7198fe6 | 7198fe6 + facts + colour writes | macbox, 2026-10-28 |

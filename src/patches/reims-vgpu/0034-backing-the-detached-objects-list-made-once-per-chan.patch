@@ -1,0 +1,220 @@
+From e7906be911a130d9ef4516fb6b14f2067a915c4a Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 19:00:29 +0200
+Subject: [PATCH 34/35] backing: the detached objects' list made once per
+ change, sorted, asked by binary search
+
+A submission check (on metal2vulkan's scheduler thread, inside its pass) made the list of every object
+detached now, plus those released since the command buffer was made, from the registry's BTreeSet and
+BTreeMap, for each submission while any object was detached, and the runtime scanned it for each
+resource the submission named: 18-24% of the scheduler thread's CPU in production (2026-11-14 profile).
+The registry now keeps the detached objects as one sorted Arc<[ObjectId]>, made at the first check after
+a detach, attach or release and shared until the next; releases after the command buffer (the last of
+`releases`) are merged in only where there are any. The runtime is asked with uses_sorted (metal2vulkan
+0100). Tests: the list is sorted and shared until a change; over 3000 random detaches, attaches,
+releases, makes and closes, every open command buffer's list is exactly the one made from scratch.
+---
+ crates/reims-vgpu-vulkan/src/gpu/backing.rs | 124 ++++++++++++++++++--
+ 1 file changed, 116 insertions(+), 8 deletions(-)
+
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/backing.rs b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+index b6afafa1..053b7321 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/backing.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+@@ -761,6 +761,12 @@ struct Detached {
+     open: BTreeMap<u64, Arc<Open>>,
+     /// The fewest open command buffers since those that hold nothing were last let go of.
+     fewest: usize,
++    /// LOCAL (Atlas): `detached` as a sorted list, made at the first [`Detached::failing`] after
++    /// it changed and shared until it changes again. Each submission of a command buffer checked
++    /// while any object is detached asks with it (`rt::Submission::uses_sorted`), on the runtime's
++    /// scheduler thread: made again for each, the list took a fifth of that thread's time in
++    /// production (2026-11-14).
++    list: Option<Arc<[rt::ObjectId]>>,
+ }
+ 
+ /// An open command buffer ([`Opened`]): its number, the isolated task that made it, if one did,
+@@ -822,11 +828,27 @@ impl Detached {
+ 
+     /// The objects a command buffer made at `made` fails by where it uses one: those detached
+     /// now, and those released detached after it was made.
+-    fn failing(&self, made: u64) -> Vec<rt::ObjectId> {
+-        let released = (self.released.iter())
+-            .filter(|&(_, &at)| at > made)
+-            .map(|(&id, _)| id);
+-        self.detached.iter().copied().chain(released).collect()
++    /// Sorted ascending (`rt::ObjectId`'s order), each once: the list of those detached, shared
++    /// while none changes ([`Detached::list`]), or a list of its own where releases since `made`
++    /// add to it. `releases` holds the releases in the order of their numbers, so those after
++    /// `made` are its last ones.
++    fn failing(&mut self, made: u64) -> Arc<[rt::ObjectId]> {
++        let detached = Arc::clone(
++            self.list
++                .get_or_insert_with(|| self.detached.iter().copied().collect()),
++        );
++        let after = self.releases.iter().rev().take_while(|&&(at, _)| at > made);
++        let mut released: Vec<rt::ObjectId> = after
++            .map(|&(_, id)| id)
++            .filter(|id| self.released.get(id).is_some_and(|&at| at > made))
++            .collect();
++        if released.is_empty() {
++            return detached;
++        }
++        released.extend(detached.iter().copied());
++        released.sort_unstable();
++        released.dedup();
++        released.into()
+     }
+ 
+     /// The open command buffers that hold nothing let go of ([`Detached::open`]).
+@@ -858,6 +880,7 @@ impl Registry {
+                 releases: VecDeque::new(),
+                 open: BTreeMap::new(),
+                 fewest: 0,
++                list: None,
+             }),
+             #[cfg(test)]
+             between: None,
+@@ -896,6 +919,7 @@ impl Registry {
+     fn detached(&self, id: rt::ObjectId) {
+         let mut state = self.state.lock();
+         state.detached.insert(id);
++        state.list = None;
+         self.detached.store(state.detached.len(), Ordering::SeqCst);
+     }
+ 
+@@ -905,6 +929,7 @@ impl Registry {
+     fn attached(&self, id: rt::ObjectId) {
+         let mut state = self.state.lock();
+         state.detached.remove(&id);
++        state.list = None;
+         self.detached.store(state.detached.len(), Ordering::SeqCst);
+     }
+ 
+@@ -916,6 +941,7 @@ impl Registry {
+     fn released(&self, id: rt::ObjectId) {
+         let mut state = self.state.lock();
+         state.detached.remove(&id);
++        state.list = None;
+         let number = state.number();
+         if !state.open.is_empty() {
+             state.released.insert(id, number);
+@@ -939,7 +965,7 @@ impl Registry {
+ 
+     /// The objects a command buffer made at `made` fails by where it uses one
+     /// ([`Detached::failing`]).
+-    fn failing(&self, made: u64) -> Vec<rt::ObjectId> {
++    fn failing(&self, made: u64) -> Arc<[rt::ObjectId]> {
+         self.state.lock().failing(made)
+     }
+ 
+@@ -1022,7 +1048,7 @@ impl Opened {
+         let objects = MADE.load(Ordering::SeqCst);
+         let number = self.0.number;
+         let mut submitted = self.0.submitted.lock();
+-        if DETACHED.any(number) && submission.uses(&DETACHED.failing(number)) {
++        if DETACHED.any(number) && submission.uses_sorted(&DETACHED.failing(number)) {
+             return NonZeroU64::new(DETACHED_USE);
+         }
+         DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
+@@ -1052,7 +1078,7 @@ impl Drop for Opened {
+ /// (`rt::CommandBuffer::uses`) only where an object could fail it.
+ pub(crate) fn uses_detached(cb: &rt::CommandBuffer, opened: &Opened) -> bool {
+     let number = opened.0.number;
+-    DETACHED.any(number) && cb.uses(&DETACHED.failing(number))
++    DETACHED.any(number) && cb.uses_sorted(&DETACHED.failing(number))
+ }
+ 
+ /// The check of each submission of the command buffer committed as `cb`
+@@ -2237,6 +2263,88 @@ mod tests {
+         d.closed(new);
+     }
+ 
++    /// LOCAL (Atlas): the list a submission is checked against is sorted, each object once, and
++    /// one list, shared, while nothing is detached, attached or released: no list is made for
++    /// each submission. A detach, an attach and a release each make the next read a new one
++    #[test]
++    fn the_failing_list_is_sorted_and_shared_until_it_changes() {
++        let d = registry();
++        let objects: [rt::ObjectId; 6] = ids();
++        let cb = made(&d, None);
++        for &id in objects.iter().rev().skip(1) {
++            d.detached(id);
++        }
++        let first = d.failing(cb);
++        let mut want: Vec<rt::ObjectId> = objects[..5].to_vec();
++        want.sort();
++        assert_eq!(&*first, &want[..], "sorted, each once");
++        assert!(Arc::ptr_eq(&first, &d.failing(cb)), "shared while nothing changes");
++        d.detached(objects[5]);
++        let second = d.failing(cb);
++        assert!(!Arc::ptr_eq(&first, &second) && second.contains(&objects[5]), "a detach");
++        d.attached(objects[0]);
++        let third = d.failing(cb);
++        assert!(!third.contains(&objects[0]) && third.is_sorted(), "an attach");
++        let cb = committed(&d, cb);
++        d.released(objects[1]);
++        let after = made(&d, None);
++        assert!(d.failing(cb).contains(&objects[1]) && d.failing(cb).is_sorted(), "made before the release");
++        assert!(!d.failing(after).contains(&objects[1]), "made after it");
++        assert!(Arc::ptr_eq(&d.failing(after), &d.failing(after)), "no release after it: the shared list");
++        d.closed(cb);
++        d.closed(after);
++    }
++
++    /// LOCAL (Atlas): over a long run of detaches, attaches, releases, makes and closes, the list
++    /// for every open command buffer holds exactly what the list made from scratch held before
++    /// (those detached, and those released after it was made), sorted
++    #[test]
++    fn the_failing_list_holds_what_the_list_made_each_time_held() {
++        let d = registry();
++        let objects: [rt::ObjectId; 24] = ids();
++        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
++        let mut next = |n: u64| {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed % n
++        };
++        let mut opened: Vec<u64> = Vec::new();
++        let mut released: std::collections::HashSet<rt::ObjectId> = Default::default();
++        for step in 0..3000 {
++            let id = objects[next(24) as usize];
++            match next(6) {
++                0 | 1 if !released.contains(&id) => d.detached(id),
++                2 => d.attached(id),
++                3 if !released.contains(&id) && d.state.lock().detached.contains(&id) => {
++                    d.released(id);
++                    released.insert(id);
++                }
++                4 => opened.push(committed(&d, made(&d, None))),
++                5 if !opened.is_empty() => {
++                    let at = next(opened.len() as u64) as usize;
++                    d.closed(opened.remove(at));
++                }
++                _ => {}
++            }
++            for &cb in &opened {
++                let state = d.state.lock();
++                let mut want: Vec<rt::ObjectId> = (state.released.iter())
++                    .filter(|&(_, &at)| at > cb)
++                    .map(|(&id, _)| id)
++                    .chain(state.detached.iter().copied())
++                    .collect();
++                drop(state);
++                want.sort();
++                want.dedup();
++                assert_eq!(&*d.failing(cb), &want[..], "step {step}, command buffer {cb}");
++            }
++        }
++        for cb in opened {
++            d.closed(cb);
++        }
++    }
++
+     /// A command buffer committed while a buffer it fills is detached fails with code 8 as it is
+     /// submitted, as Metal's (`tests/detach_backing.rs`'s `never_replaced`), on every host: the
+     /// detached buffer lies in no memory, so no host keeps what a command that reaches it unnamed
+-- 
+2.53.0
+

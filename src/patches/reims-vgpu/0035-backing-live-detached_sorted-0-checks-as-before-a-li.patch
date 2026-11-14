@@ -1,0 +1,113 @@
+From 83205fb36708be300e2767ccc9289d7ffce39d4e Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 19:09:38 +0200
+Subject: [PATCH 35/35] backing: live detached_sorted=0 checks as before (a
+ list made for each check, scanned), for an A/B in one boot
+
+On by default. The test asks of an object detached, one released after the command buffer was made and one
+neither, with the switch on and off, and gets the same answers.
+---
+ crates/reims-vgpu-vulkan/src/gpu/backing.rs | 59 ++++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu-vulkan/src/gpu/backing.rs b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+index 053b7321..7a2d8fc4 100644
+--- a/crates/reims-vgpu-vulkan/src/gpu/backing.rs
++++ b/crates/reims-vgpu-vulkan/src/gpu/backing.rs
+@@ -851,6 +851,15 @@ impl Detached {
+         released.into()
+     }
+ 
++    /// LOCAL (Atlas, lab): the list [`Detached::failing`] replaced, made for each check as before
++    /// (unsorted; asked by a scan), for the live A/B `detached_sorted=0`.
++    fn failing_scratch(&self, made: u64) -> Vec<rt::ObjectId> {
++        let released = (self.released.iter())
++            .filter(|&(_, &at)| at > made)
++            .map(|(&id, _)| id);
++        self.detached.iter().copied().chain(released).collect()
++    }
++
+     /// The open command buffers that hold nothing let go of ([`Detached::open`]).
+     fn prune(&mut self) {
+         while let Some(oldest) = self.open.first_entry()
+@@ -969,6 +978,25 @@ impl Registry {
+         self.state.lock().failing(made)
+     }
+ 
++    /// LOCAL (Atlas, lab): whether the command buffer made at `made` (one of whose objects, `uses`
++    /// says of a list, could fail it) uses an object it fails by: asked with the shared sorted list
++    /// ([`Detached::failing`]), or, where live `detached_sorted=0`, with a list made for this check
++    /// alone and scanned, as before (the A/B of 2026-11-14). `uses_sorted` binary-searches a sorted
++    /// list; `uses` scans any.
++    fn uses_failing(
++        &self,
++        made: u64,
++        uses_sorted: impl FnOnce(&[rt::ObjectId]) -> bool,
++        uses: impl FnOnce(&[rt::ObjectId]) -> bool,
++    ) -> bool {
++        if rt::live::on("detached_sorted", true) {
++            uses_sorted(&self.failing(made))
++        } else {
++            let list = self.state.lock().failing_scratch(made);
++            uses(&list)
++        }
++    }
++
+     /// Whether a command buffer made at `made` fails where it uses any of `ids`, as the runtime
+     /// answers of what it uses and [`Registry::failing`] ([`Opened::submit`]).
+     #[cfg(test)]
+@@ -1048,7 +1076,9 @@ impl Opened {
+         let objects = MADE.load(Ordering::SeqCst);
+         let number = self.0.number;
+         let mut submitted = self.0.submitted.lock();
+-        if DETACHED.any(number) && submission.uses_sorted(&DETACHED.failing(number)) {
++        if DETACHED.any(number)
++            && DETACHED.uses_failing(number, |l| submission.uses_sorted(l), |l| submission.uses(l))
++        {
+             return NonZeroU64::new(DETACHED_USE);
+         }
+         DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
+@@ -1078,7 +1108,7 @@ impl Drop for Opened {
+ /// (`rt::CommandBuffer::uses`) only where an object could fail it.
+ pub(crate) fn uses_detached(cb: &rt::CommandBuffer, opened: &Opened) -> bool {
+     let number = opened.0.number;
+-    DETACHED.any(number) && cb.uses_sorted(&DETACHED.failing(number))
++    DETACHED.any(number) && DETACHED.uses_failing(number, |l| cb.uses_sorted(l), |l| cb.uses(l))
+ }
+ 
+ /// The check of each submission of the command buffer committed as `cb`
+@@ -2295,6 +2325,31 @@ mod tests {
+         d.closed(after);
+     }
+ 
++    /// LOCAL (Atlas): live `detached_sorted=0`, the A/B's arm as before, answers each question as
++    /// the shared sorted list does: an object detached, one released after the command buffer was
++    /// made, and one neither
++    #[test]
++    fn the_check_as_before_answers_as_the_sorted_one() {
++        let d = registry();
++        let objects: [rt::ObjectId; 6] = ids();
++        let cb = made(&d, None);
++        for &id in &objects[..3] {
++            d.detached(id);
++        }
++        let cb = committed(&d, cb);
++        d.released(objects[3]);
++        let ask = |id: rt::ObjectId| {
++            d.uses_failing(cb, |l| l.binary_search(&id).is_ok(), |l| l.contains(&id))
++        };
++        let sorted: Vec<bool> = objects.iter().map(|&id| ask(id)).collect();
++        rt::live::set("detached_sorted", Some("0"));
++        let before: Vec<bool> = objects.iter().map(|&id| ask(id)).collect();
++        rt::live::set("detached_sorted", None);
++        assert_eq!(sorted, [true, true, true, true, false, false]);
++        assert_eq!(before, sorted);
++        d.closed(cb);
++    }
++
+     /// LOCAL (Atlas): over a long run of detaches, attaches, releases, makes and closes, the list
+     /// for every open command buffer holds exactly what the list made from scratch held before
+     /// (those detached, and those released after it was made), sorted
+-- 
+2.53.0
+

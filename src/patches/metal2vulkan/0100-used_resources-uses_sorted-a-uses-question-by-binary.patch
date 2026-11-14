@@ -1,0 +1,235 @@
+From 12d5fa3c51bc2d4af63b0c72726d5b10b703bc47 Mon Sep 17 00:00:00 2001
+From: Atlas agent <agent@atlas.local>
+Date: Sat, 14 Nov 2026 19:00:29 +0200
+Subject: [PATCH] used_resources: uses_sorted, a uses question by binary search
+ (for a program's check of many objects)
+
+Submission::uses_sorted and CommandBuffer::uses_sorted answer as uses for identities sorted ascending,
+each identity the commands name looked up by binary search, not by a scan of all of them (Among). Reims's
+submission check asks on every submission, on the scheduler's thread inside its pass, whether the
+submission uses any detached object; with hundreds detached, the scan per used resource (names_any) and
+Reims's list made for each check took a fifth of that thread's CPU in production (2026-11-14 profile:
+run_checks 18-24%, names_any 5%). The submission-check lanes assert the sorted answer is the scan's on
+every submission they check; a unit test checks Among against a scan, and that an unsorted list said
+sorted is caught in a debug build.
+---
+ .../src/command_buffer/checks.rs              | 11 ++++-
+ .../src/command_buffer/mod.rs                 |  4 +-
+ crates/metal2vulkan-runtime/src/heap.rs       |  2 +-
+ crates/metal2vulkan-runtime/src/tests/mod.rs  |  1 +
+ .../src/tests/uses_sorted.rs                  | 31 ++++++++++++
+ .../src/used_resources.rs                     | 47 +++++++++++++++++--
+ .../src/runtime_lane/submission_checks.rs     |  4 ++
+ 7 files changed, 92 insertions(+), 8 deletions(-)
+ create mode 100644 crates/metal2vulkan-runtime/src/tests/uses_sorted.rs
+
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/checks.rs b/crates/metal2vulkan-runtime/src/command_buffer/checks.rs
+index 7a4c2d9db..3e156886d 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/checks.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/checks.rs
+@@ -118,7 +118,16 @@ impl Submission<'_> {
+     /// [`CommandBuffer::uses`] answers: no handle is cloned or held.
+     pub fn uses(&self, objects: &[ObjectId]) -> bool {
+         let shared = self.command_buffer.device().shared();
+-        (self.command_buffer.state()).uses(shared, Some(self.encoders.clone()), objects)
++        (self.command_buffer.state()).uses(shared, Some(self.encoders.clone()), crate::used_resources::Among::Any(objects))
++    }
++
++    /// [`uses`](Self::uses) for `objects` sorted ascending (`ObjectId`'s order, as a `BTreeSet`
++    /// iterates them): the same answer, each identity the commands name looked up by binary
++    /// search, not by a scan of `objects`. LOCAL (Atlas): a check that asks about many objects on
++    /// every submission runs on the scheduler's thread, inside its pass.
++    pub fn uses_sorted(&self, objects: &[ObjectId]) -> bool {
++        let shared = self.command_buffer.device().shared();
++        (self.command_buffer.state()).uses(shared, Some(self.encoders.clone()), crate::used_resources::Among::sorted(objects))
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 1066b5379..a7ffc7fcd 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -105,7 +105,7 @@ use super::texture::Texture;
+ use super::tracker::Footprint;
+ use super::unique_identifier::ScheduledWork;
+ use super::upload::{Upload, Uploads};
+-use super::used_resources::{names_any, EncoderKind, EncoderRecord, Reached, ReadRecord};
++use super::used_resources::{names_any, Among, EncoderKind, EncoderRecord, Reached, ReadRecord};
+ use super::values::CommandBufferStatus;
+ use super::{Buffer, CommandQueue, Device};
+ use crate::release;
+@@ -908,7 +908,7 @@ impl State {
+         &self,
+         shared: &super::device::DeviceShared,
+         encoders: Option<Range<usize>>,
+-        objects: &[ObjectId],
++        objects: Among<'_>,
+     ) -> bool {
+         let range = encoders.unwrap_or(0..self.ended.len());
+         let Some(records) = self.ended.get(range.clone()) else {
+diff --git a/crates/metal2vulkan-runtime/src/heap.rs b/crates/metal2vulkan-runtime/src/heap.rs
+index f542ba9e2..8c3ba3e12 100644
+--- a/crates/metal2vulkan-runtime/src/heap.rs
++++ b/crates/metal2vulkan-runtime/src/heap.rs
+@@ -381,7 +381,7 @@ impl HeapKeys {
+     pub(super) fn names_any<'a>(
+         &self,
+         keys: impl IntoIterator<Item = &'a ResourceKey>,
+-        objects: &[ObjectId],
++        objects: super::used_resources::Among<'_>,
+     ) -> bool {
+         let heaps = lock(&self.heaps);
+         keys.into_iter()
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index cd0f95164..6ae574ba8 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -247,6 +247,7 @@ mod shader_cache_queue;
+ mod shader_cache_time;
+ mod coherent_late;
+ mod coherent_trap_wait;
++mod uses_sorted;
+ mod shadow;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod shadow_carried_read;
+diff --git a/crates/metal2vulkan-runtime/src/tests/uses_sorted.rs b/crates/metal2vulkan-runtime/src/tests/uses_sorted.rs
+new file mode 100644
+index 000000000..59060b21d
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/uses_sorted.rs
+@@ -0,0 +1,31 @@
++//! LOCAL (Atlas): `Among`, the identities a `uses` question asks about: looked up sorted, by
++//! binary search, each answer is a scan's.
++
++use crate::resource::ObjectId;
++use crate::used_resources::Among;
++
++/// Of 300 identities, every third asked about, in a shuffled order and sorted: for each of the
++/// 300, and for none asked, the binary search answers as the scan.
++#[test]
++fn a_sorted_question_answers_as_a_scan() {
++    let ids: Vec<ObjectId> = (0..300).map(|_| ObjectId::new()).collect();
++    let mut asked: Vec<ObjectId> = ids.iter().copied().step_by(3).collect();
++    asked.reverse();
++    asked.swap(0, 50);
++    let mut sorted = asked.clone();
++    sorted.sort();
++    for id in &ids {
++        assert_eq!(Among::Any(&asked).contains(id), Among::Sorted(&sorted).contains(id), "{id:?}");
++    }
++    assert_eq!((ids.iter()).filter(|id| Among::Sorted(&sorted).contains(id)).count(), 100);
++    assert!(Among::Sorted(&[]).is_empty() && !Among::Sorted(&sorted).is_empty());
++}
++
++/// A question said sorted that is not is caught in a debug build.
++#[test]
++#[should_panic(expected = "identities said sorted are not")]
++#[cfg(debug_assertions)]
++fn an_unsorted_question_said_sorted_is_caught() {
++    let ids: Vec<ObjectId> = (0..3).map(|_| ObjectId::new()).collect();
++    let _ = Among::sorted(&[ids[2], ids[0]]);
++}
+diff --git a/crates/metal2vulkan-runtime/src/used_resources.rs b/crates/metal2vulkan-runtime/src/used_resources.rs
+index 61f56de65..1795c3fcd 100644
+--- a/crates/metal2vulkan-runtime/src/used_resources.rs
++++ b/crates/metal2vulkan-runtime/src/used_resources.rs
+@@ -301,7 +301,7 @@ impl Owners {
+     fn names_any<'a>(
+         &self,
+         keys: impl IntoIterator<Item = &'a ResourceKey>,
+-        objects: &[ObjectId],
++        objects: Among<'_>,
+     ) -> bool {
+         let registry = lock(&self.inner);
+         keys.into_iter()
+@@ -318,7 +318,7 @@ pub(super) fn names_any<'a>(
+     shared: &super::device::DeviceShared,
+     keys: impl IntoIterator<Item = &'a ResourceKey> + Clone,
+     residency: Option<&Residency>,
+-    objects: &[ObjectId],
++    objects: Among<'_>,
+ ) -> bool {
+     if objects.is_empty() {
+         return false;
+@@ -552,6 +552,38 @@ impl CommandBuffer {
+     }
+ }
+ 
++/// LOCAL (Atlas): the identities a `uses` question asks about: in any order, looked up one by one,
++/// or sorted ascending (`ObjectId`'s order, as a `BTreeSet` iterates them), looked up by binary
++/// search. A program that asks with many identities on each submission (Reims's check of the
++/// detached objects, `CommandBuffer::set_submission_check`) asks with them sorted: the answer is
++/// the same, without a scan of all of them for each resource the commands name.
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum Among<'a> {
++    Any(&'a [ObjectId]),
++    Sorted(&'a [ObjectId]),
++}
++
++impl Among<'_> {
++    pub(crate) fn contains(&self, id: &ObjectId) -> bool {
++        match self {
++            Among::Any(objects) => objects.contains(id),
++            Among::Sorted(objects) => objects.binary_search(id).is_ok(),
++        }
++    }
++
++    pub(crate) fn is_empty(&self) -> bool {
++        match self {
++            Among::Any(objects) | Among::Sorted(objects) => objects.is_empty(),
++        }
++    }
++
++    /// `objects` as asked: sorted where the caller said so; in a debug build that is checked.
++    pub(crate) fn sorted(objects: &[ObjectId]) -> Among<'_> {
++        debug_assert!(objects.is_sorted(), "identities said sorted are not");
++        Among::Sorted(objects)
++    }
++}
++
+ impl CommandBuffer {
+     /// Whether the commands of its ended encoders use any of `objects`, the identities
+     /// ([`Buffer::object_id`], [`Texture::object_id`], [`Heap::object_id`]) of what
+@@ -563,7 +595,14 @@ impl CommandBuffer {
+     /// command buffer completed, and for an empty `objects`.
+     pub fn uses(&self, objects: &[ObjectId]) -> bool {
+         self.settle_end();
+-        self.state().uses(self.device().shared(), None, objects)
++        self.state().uses(self.device().shared(), None, Among::Any(objects))
++    }
++
++    /// [`uses`](Self::uses) for `objects` sorted ascending (`ObjectId`'s order): the same answer,
++    /// each identity looked up by binary search. LOCAL (Atlas).
++    pub fn uses_sorted(&self, objects: &[ObjectId]) -> bool {
++        self.settle_end();
++        self.state().uses(self.device().shared(), None, Among::sorted(objects))
+     }
+ 
+     /// Whether the commands of its ended encoders at `encoders` (their places, the index of
+@@ -572,7 +611,7 @@ impl CommandBuffer {
+     /// a runtime extension, no Metal call. False for a range past its ended encoders.
+     pub fn encoders_use(&self, encoders: std::ops::Range<usize>, objects: &[ObjectId]) -> bool {
+         self.settle_end();
+-        (self.state()).uses(self.device().shared(), Some(encoders), objects)
++        (self.state()).uses(self.device().shared(), Some(encoders), Among::Any(objects))
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-validation/src/runtime_lane/submission_checks.rs b/crates/metal2vulkan-validation/src/runtime_lane/submission_checks.rs
+index 5d44a1d0c..ab2ea03aa 100644
+--- a/crates/metal2vulkan-validation/src/runtime_lane/submission_checks.rs
++++ b/crates/metal2vulkan-validation/src/runtime_lane/submission_checks.rs
+@@ -88,6 +88,10 @@ impl Detach {
+             .any(|id| detached.contains(&id));
+         // The identity answer, with no listing, is the listing's.
+         assert_eq!(submission.uses(&detached), hit, "{detached:?}");
++        // Sorted, by binary search (LOCAL, Atlas): the same answer.
++        let mut sorted = detached.clone();
++        sorted.sort();
++        assert_eq!(submission.uses_sorted(&sorted), hit, "{sorted:?}");
+         hit.then(|| NonZeroU64::new(DETACHED).unwrap())
+     }
+ 
+-- 
+2.53.0
+
