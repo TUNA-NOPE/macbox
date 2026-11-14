@@ -4,7 +4,11 @@
 // then polls the framebuffer IOSurface's seed at about 2 kHz: each seed change is a
 // new frame the simulator's compositor wrote. Frame callbacks are counted too.
 //
-//   simfps <udid> <seconds> [label]   prints one JSON line
+//   simfps <udid> <seconds> [label] [--strip]   prints one JSON line
+//
+// --strip also reads GlassBench's frame strip (a 16-bit counter the app draws every tick, see
+// GlassBench/main.swift) from each new surface: how many app frames reached the screen, how many were
+// lost on the way (gaps in the counter) and how many surface frames showed no new app frame (repeats).
 import Foundation
 import IOSurface
 import ObjectiveC
@@ -24,7 +28,8 @@ typealias PropCB = @convention(block) (AnyObject?) -> Void
 
 func die(_ s: String) -> Never { FileHandle.standardError.write((s + "\n").data(using: .utf8)!); exit(1) }
 
-let args = CommandLine.arguments
+let readStrip = CommandLine.arguments.contains("--strip")
+let args = CommandLine.arguments.filter { $0 != "--strip" }
 guard args.count >= 3, let secs = Double(args[2]) else { die("usage: simfps <udid> <seconds> [label]") }
 let udid = args[1], label = args.count > 3 ? args[3] : ""
 let dev = "/Applications/Xcode.app/Contents/Developer"
@@ -90,6 +95,27 @@ let w = IOSurfaceGetWidth(surf0), h = IOSurfaceGetHeight(surf0)
 var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
 func nowNs() -> UInt64 { mach_absolute_time() * UInt64(tb.numer) / UInt64(tb.denom) }
 var stamps: [UInt64] = []
+var strip: [(UInt64, Int)] = []  // (time, counter or -1 when unreadable)
+/// GlassBench's counter from a BGRA surface: 18 blocks of 20 pt from (21, 120) pt, at the surface's scale.
+func readCounter(_ s: IOSurface) -> Int {
+    let w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s)
+    let scale = Double(w) / 402.0
+    guard IOSurfaceLock(s, .readOnly, nil) == kIOReturnSuccess else { return -1 }
+    defer { IOSurfaceUnlock(s, .readOnly, nil) }
+    let base = IOSurfaceGetBaseAddress(s).assumingMemoryBound(to: UInt8.self)
+    func luma(_ i: Int) -> Int {
+        let x = Int((21 + 20 * Double(i) + 10) * scale), y = Int(130 * scale)
+        guard x < w, y < h else { return 0 }
+        let p = base + y * bpr + x * 4
+        return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3
+    }
+    let white = luma(0), black = luma(1)
+    guard white - black > 100 else { return -1 }
+    let mid = (white + black) / 2
+    var n = 0
+    for b in 0..<16 where luma(b + 2) > mid { n |= 1 << b }
+    return n
+}
 stamps.reserveCapacity(Int(secs * 200))
 var polls = 0
 let start = nowNs(), end = start + UInt64(secs * 1e9)
@@ -103,7 +129,10 @@ let poller = Thread {
         if t >= end { break }
         lock.lock(); let s = surface ?? lastSurf; lock.unlock()
         let seed = IOSurfaceGetSeed(s)
-        if s !== lastSurf || seed != lastSeed { stamps.append(t); lastSeed = seed; lastSurf = s }
+        if s !== lastSurf || seed != lastSeed {
+            stamps.append(t); lastSeed = seed; lastSurf = s
+            if readStrip { strip.append((t, readCounter(s))) }
+        }
         polls += 1
         usleep(500)
     }
@@ -133,5 +162,30 @@ let out: [String: Any] = [
     "p99_ms": (pct(0.99) * 10).rounded() / 10, "max_ms": ((iv.last ?? 0) * 10).rounded() / 10,
     "gt25ms": over(25), "gt50ms": over(50), "gt100ms": over(100),
 ]
-let data = try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+var result = out
+if readStrip {
+    // Unique app frames, their intervals, frames lost between the app and the screen, and repeats.
+    var unique: [(UInt64, Int)] = [], repeats = 0, lost = 0, unreadable = 0
+    for (t, c) in strip {
+        if c < 0 { unreadable += 1; continue }
+        if let last = unique.last {
+            let d = (c - last.1 + 65536) % 65536
+            if d == 0 { repeats += 1; continue }
+            if d < 1000 { lost += d - 1 }
+        }
+        unique.append((t, c))
+    }
+    var uiv: [Double] = []
+    for i in 1..<max(unique.count, 1) where unique.count > 1 { uiv.append(Double(unique[i].0 - unique[i - 1].0) / 1e6) }
+    uiv.sort()
+    func up(_ p: Double) -> Double { uiv.isEmpty ? 0 : (uiv[min(uiv.count - 1, Int(Double(uiv.count - 1) * p))] * 10).rounded() / 10 }
+    let uspan = unique.count > 1 ? Double(unique.last!.0 - unique.first!.0) / 1e9 : secs
+    result["strip"] = [
+        "unique": unique.count, "unique_fps": unique.count > 1 ? ((Double(unique.count - 1) / uspan) * 10).rounded() / 10 : 0,
+        "lost": lost, "repeats": repeats, "unreadable": unreadable,
+        "p50_ms": up(0.5), "p95_ms": up(0.95), "p99_ms": up(0.99), "max_ms": up(1.0),
+        "gt20ms": uiv.filter { $0 > 20 }.count, "gt34ms": uiv.filter { $0 > 34 }.count,
+    ] as [String: Any]
+}
+let data = try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)

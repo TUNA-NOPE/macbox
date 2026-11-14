@@ -10,8 +10,8 @@ ssh macbox 'cd ~/.macbox/bench && ./build.sh'
 
 | | |
 |---|---|
-| `simfps <udid> <seconds> [label]` | counts the frames a simulator's screen produces, straight from CoreSimulator's framebuffer (no encoder in the way); one JSON line with fps and frame intervals |
-| `GlassBench.app` | the iOS load: a table scrolling by itself under Liquid Glass bars and a floating glass toolbar |
+| `simfps <udid> <seconds> [label] [--strip]` | counts the frames a simulator's screen produces, straight from CoreSimulator's framebuffer (no encoder in the way); one JSON line with fps and frame intervals. `--strip` also reads GlassBench's frame counter from each new picture (its synced reads slow the 2 kHz poll, so count frames without it) |
+| `GlassBench.app` | the iOS load: a table scrolling by itself under Liquid Glass bars and a floating glass toolbar. It draws a **frame strip** at the top left: a 16-bit counter that advances every display-link tick, as 18 squares of 20 pt from (21, 120) pt (white and black references, then bits 0-15), large enough to survive H.264, so any viewer can tell unique frames from repeats and count the ones lost on the way. Its own tick intervals go to `Documents/pace.json` in its container every 5 s. `-nostrip` leaves the strip out |
 | `GenieBench.app` | the desktop load: a window that minimizes and restores, for counting the Genie animation's frames |
 | `scroll-local.html` | a page for Safari that scrolls itself under a blurred floating bar, with no network |
 

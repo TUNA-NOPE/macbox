@@ -2,11 +2,68 @@
 // A table of cards scrolls by itself at a fixed speed (time-based, so a dropped
 // frame skips content rather than slowing the scroll) under a glass navigation bar,
 // a glass tab bar and a floating glass toolbar with a glass button that keeps pulsing.
-// Launch arguments: -noglass (no floating glass, opaque bars), -speed <pt/s>.
+// Launch arguments: -noglass (no floating glass, opaque bars), -speed <pt/s>, -nostrip.
+//
+// The frame strip: every display-link tick draws a 16-bit counter as blocks at the top left, so a
+// frame can be told apart from the one before it all the way to a viewer (simfps --strip at the
+// simulator's screen, bench/panelbench.py through Simlock's gateway, panel-hook.js in T3's Device panel):
+// 18 squares of 20 pt from (21, 120) pt: white, black (the references), then bit 0..15 (white = 1).
+// Gaps in the counter are frames lost, repeats are frames shown twice.
 import UIKit
 
 let launchArgs = ProcessInfo.processInfo.arguments
 let noGlass = launchArgs.contains("-noglass")
+let showStrip = !launchArgs.contains("-nostrip")
+
+final class FrameStrip: UIView {
+    static let origin = CGPoint(x: 21, y: 120), block: CGFloat = 20
+    private var bits: [CALayer] = []
+    private(set) var count: UInt16 = 0
+    init() {
+        super.init(frame: CGRect(x: Self.origin.x, y: Self.origin.y, width: Self.block * 18, height: Self.block))
+        isUserInteractionEnabled = false
+        for i in 0..<18 {
+            let l = CALayer()
+            l.frame = CGRect(x: CGFloat(i) * Self.block, y: 0, width: Self.block, height: Self.block)
+            l.backgroundColor = (i == 1 ? UIColor.black : UIColor.white).cgColor
+            layer.addSublayer(l); bits.append(l)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func tick() {
+        count &+= 1
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for b in 0..<16 { bits[b + 2].backgroundColor = ((count >> UInt16(b)) & 1 == 1 ? UIColor.white : UIColor.black).cgColor }
+        CATransaction.commit()
+    }
+}
+var frameStrip: FrameStrip?
+
+/// The app's own frame times: every 5 s, Documents/pace.json gets the display link's tick intervals over the
+/// last window (what the app produced, before the compositor, the capture and the stream).
+final class TickLog {
+    private var stamps: [CFTimeInterval] = []
+    private var last = CACurrentMediaTime()
+    private let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("pace.json")
+    func tick(_ t: CFTimeInterval, counter: UInt16) {
+        stamps.append(t)
+        guard t - last >= 5, stamps.count > 1 else { return }
+        var iv = zip(stamps, stamps.dropFirst()).map { ($1 - $0) * 1000 }
+        iv.sort()
+        func p(_ q: Double) -> Double { (iv[min(iv.count - 1, Int(Double(iv.count - 1) * q))] * 10).rounded() / 10 }
+        let out: [String: Any] = ["at": Date().timeIntervalSince1970, "counter": Int(counter), "ticks": iv.count,
+                                  "fps": ((Double(iv.count) / (stamps.last! - stamps.first!)) * 10).rounded() / 10,
+                                  "p50_ms": p(0.5), "p95_ms": p(0.95), "p99_ms": p(0.99), "max_ms": p(1),
+                                  "gt20ms": iv.filter { $0 > 20 }.count, "gt34ms": iv.filter { $0 > 34 }.count]
+        if let d = try? JSONSerialization.data(withJSONObject: out) {
+            var all = (try? Data(contentsOf: url)) ?? Data()
+            all.append(d); all.append(0x0a)
+            try? all.write(to: url)
+        }
+        stamps = [t]; last = t
+    }
+}
+let tickLog = TickLog()
 let speed: CGFloat = {
     if let i = launchArgs.firstIndex(of: "-speed"), i + 1 < launchArgs.count, let v = Double(launchArgs[i + 1]) { return CGFloat(v) }
     return 900
@@ -98,6 +155,7 @@ final class BenchViewController: UITableViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if !noGlass, let host = navigationController?.view, pulse.superview == nil { addFloatingGlass(to: host) }
+        guard link == nil else { return }  // viewDidAppear runs again on every return to the app
         link = CADisplayLink(target: self, selector: #selector(step))
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
         startTime = CACurrentMediaTime()
@@ -152,6 +210,8 @@ final class BenchViewController: UITableViewController {
         tableView.contentOffset.y = minY + CGFloat(fmod(Double(speed) * t, Double(range)))
         let s = 0.75 + 0.35 * CGFloat(sin(t * 4))
         pulse.transform = CGAffineTransform(scaleX: s, y: s)
+        frameStrip?.tick()
+        tickLog.tick(link?.timestamp ?? CACurrentMediaTime(), counter: frameStrip?.count ?? 0)
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { 400 }
@@ -184,6 +244,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         let tabs = UITabBarController(); tabs.viewControllers = [nav, other]
         if noGlass { tabs.tabBar.isHidden = true }
         let w = UIWindow(windowScene: ws); w.rootViewController = tabs; w.makeKeyAndVisible()
+        if showStrip { let f = FrameStrip(); w.addSubview(f); frameStrip = f }
         window = w
     }
 }
